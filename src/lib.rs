@@ -1,3 +1,4 @@
+pub mod byte_string;
 pub mod canon;
 mod db;
 mod densemap;

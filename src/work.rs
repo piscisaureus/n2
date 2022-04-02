@@ -1,5 +1,6 @@
 //! Build runner, choosing and executing tasks as determined by out of date inputs.
 
+use crate::byte_string::*;
 use crate::db;
 use crate::densemap::DenseMap;
 use crate::graph::*;
@@ -9,6 +10,7 @@ use crate::task;
 use crate::trace;
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::path::Path;
 use std::time::Duration;
 
 #[cfg(unix)]
@@ -43,8 +45,9 @@ pub enum BuildState {
 // Counters that track number of builds in each state.
 // Only covers builds not in the "unknown" state, which means it's only builds
 // that are considered part of the current build.
-#[derive(Clone, Debug)]
+#[derive(Copy, Clone, Debug)]
 pub struct StateCounts([usize; 5]);
+
 impl StateCounts {
     pub fn new() -> Self {
         StateCounts([0; 5])
@@ -107,16 +110,16 @@ struct BuildStates {
     /// Builds otherwise default to using an unnamed infinite pool.
     /// We expect a relatively small number of pools, such that a Vec is more
     /// efficient than a HashMap.
-    pools: Vec<(String, PoolState)>,
+    pools: Vec<(ByteString, PoolState)>,
 }
 
 impl BuildStates {
-    fn new(size: BuildId, depths: Vec<(String, usize)>) -> Self {
-        let mut pools: Vec<(String, PoolState)> = vec![
+    fn new(size: BuildId, depths: Vec<(ByteString, usize)>) -> Self {
+        let mut pools: Vec<(ByteString, PoolState)> = vec![
             // The implied default pool.
-            (String::from(""), PoolState::new(0)),
+            ("".to_byte_string(), PoolState::new(0)),
             // TODO: the console pool is just a depth-1 pool for now.
-            (String::from("console"), PoolState::new(1)),
+            ("console".to_byte_string(), PoolState::new(1)),
         ];
         pools.extend(
             depths
@@ -138,7 +141,6 @@ impl BuildStates {
     fn set(&mut self, id: BuildId, build: &Build, state: BuildState) {
         let mprev = self.states.get_mut(id);
         let prev = *mprev;
-        // println!("{:?} {:?}=>{:?}", id, prev, state);
         *mprev = state;
         match prev {
             BuildState::Ready => {
@@ -229,11 +231,11 @@ impl BuildStates {
     ) -> anyhow::Result<()> {
         // Check for a dependency cycle.
         if let Some(cycle) = stack.iter().position(|&sid| sid == id) {
-            let mut err = "dependency cycle: ".to_string();
+            let mut err = "dependency cycle: ".to_owned();
             for &id in stack[cycle..].iter() {
-                err.push_str(&format!("{} -> ", graph.file(id).name));
+                err.push_str(&format!("{} -> ", graph.file(id).name.as_str_lossy()));
             }
-            err.push_str(&graph.file(id).name);
+            err.push_str(&graph.file(id).name.as_str_lossy());
             anyhow::bail!(err);
         }
 
@@ -257,7 +259,7 @@ impl BuildStates {
 
     /// Look up a PoolState by name.
     fn get_pool(&mut self, build: &Build) -> Option<&mut PoolState> {
-        let name = build.pool.as_deref().unwrap_or("");
+        let name = build.pool.as_deref().unwrap_or(b"");
         for (key, pool) in self.pools.iter_mut() {
             if key == name {
                 return Some(pool);
@@ -268,12 +270,12 @@ impl BuildStates {
 
     /// Mark a build as ready to run.
     /// May fail if the build references an unknown pool.
-    pub fn enqueue(&mut self, id: BuildId, build: &Build) -> anyhow::Result<()> {
+    pub fn enqueue(&mut self, graph: &Graph, id: BuildId, build: &Build) -> anyhow::Result<()> {
         self.set(id, build, BuildState::Queued);
         let pool = self.get_pool(build).ok_or_else(|| {
             anyhow::anyhow!(
                 "{}: unknown pool {:?}",
-                build.location,
+                build.location.fill(graph),
                 // Unnamed pool lookups always succeed, this error is about
                 // named pools.
                 build.pool.as_ref().unwrap()
@@ -313,7 +315,7 @@ impl<'a> Work<'a> {
         last_hashes: &'a Hashes,
         db: &'a mut db::Writer,
         progress: &'a mut dyn Progress,
-        pools: Vec<(String, usize)>,
+        pools: Vec<(ByteString, usize)>,
         parallelism: usize,
     ) -> Self {
         let file_state = FileState::new(graph);
@@ -345,9 +347,10 @@ impl<'a> Work<'a> {
         self.build_states.want_file(self.graph, &mut stack, id)
     }
 
-    pub fn want_file(&mut self, name: &str) -> anyhow::Result<()> {
+    pub fn want_file(&mut self, name: impl AsRef<Path>) -> anyhow::Result<()> {
+        let name = name.as_ref();
         let target = match self.graph.lookup_file_id(name) {
-            None => anyhow::bail!("unknown path requested: {:?}", name),
+            None => anyhow::bail!("unknown path requested: {}", name.as_str_lossy()),
             Some(id) => id,
         };
         self.want_fileid(target)
@@ -357,7 +360,6 @@ impl<'a> Work<'a> {
     /// has been updated.
     fn recheck_ready(&self, id: BuildId) -> bool {
         let build = self.graph.build(id);
-        // println!("recheck {:?} {} ({}...)", id, build.location, self.graph.file(build.outs()[0]).name);
         for &id in build.ordering_ins() {
             let file = self.graph.file(id);
             match file.input {
@@ -367,13 +369,11 @@ impl<'a> Work<'a> {
                 }
                 Some(id) => {
                     if self.build_states.get(id) != BuildState::Done {
-                        // println!("  {:?} {} not done, it's {:?}", id, file.name, self.build_states.get(id));
                         return false;
                     }
                 }
             }
         }
-        // println!("{:?} now ready", id);
         true
     }
 
@@ -401,8 +401,8 @@ impl<'a> Work<'a> {
                         // file and wouldn't get here.
                         anyhow::bail!(
                             "{} used generated file {}, but has no dependency path to it",
-                            build.location,
-                            file.name
+                            build.location.fill(self.graph),
+                            file.name.as_str_lossy()
                         );
                     }
                     self.file_state.restat(id, &file.name)?
@@ -423,7 +423,7 @@ impl<'a> Work<'a> {
             None => Vec::new(),
             Some(names) => names
                 .into_iter()
-                .map(|mut name| self.graph.file_id(&mut name))
+                .map(|name| self.graph.file_id(name))
                 .collect(),
         };
         let deps_changed = self.graph.build_mut(id).update_discovered(deps);
@@ -433,8 +433,8 @@ impl<'a> Work<'a> {
             if let Some(missing) = self.ensure_discovered_stats(id)? {
                 anyhow::bail!(
                     "{} depfile references nonexistent {}",
-                    self.graph.build(id).location,
-                    self.graph.file(missing).name
+                    self.graph.build(id).location.fill(self.graph),
+                    self.graph.file(missing).name.as_str_lossy()
                 );
             }
         }
@@ -524,7 +524,8 @@ impl<'a> Work<'a> {
                             // already have been visited by this point.
                             panic!(
                                 "{}: should already have file state for generated input {}",
-                                build.location, &file.name
+                                build.location.fill(self.graph),
+                                &file.name.as_str_lossy()
                             );
                         }
                         self.file_state.restat(id, &file.name)?
@@ -534,7 +535,11 @@ impl<'a> Work<'a> {
                     if workaround_missing_phony_deps {
                         continue;
                     }
-                    anyhow::bail!("{}: input {} missing", build.location, file.name);
+                    anyhow::bail!(
+                        "{}: input {} missing",
+                        build.location.fill(self.graph),
+                        file.name.as_str_lossy()
+                    );
                 }
             }
 
@@ -554,7 +559,11 @@ impl<'a> Work<'a> {
                     if workaround_missing_phony_deps {
                         continue;
                     }
-                    anyhow::bail!("{}: input {} missing", build.location, file.name);
+                    anyhow::bail!(
+                        "{}: input {} missing",
+                        build.location.fill(self.graph),
+                        file.name.as_str_lossy()
+                    );
                 }
             }
         }
@@ -574,7 +583,7 @@ impl<'a> Work<'a> {
         for &id in self.graph.build(id).outs() {
             let file = self.graph.file(id);
             if self.file_state.get(id).is_some() {
-                panic!("expected no file state for {}", file.name);
+                panic!("expected no file state for {}", file.name.as_str_lossy());
             }
             let mtime = self.file_state.restat(id, &file.name)?;
             if mtime == MTime::Missing {
@@ -618,7 +627,7 @@ impl<'a> Work<'a> {
     fn create_parent_dirs(&self, ids: &[FileId]) -> anyhow::Result<()> {
         let mut dirs: Vec<&std::path::Path> = Vec::new();
         for &out in ids {
-            if let Some(parent) = std::path::Path::new(&self.graph.file(out).name).parent() {
+            if let Some(parent) = std::path::Path::new(&*self.graph.file(out).name).parent() {
                 if dirs.iter().any(|&p| p == parent) {
                     continue;
                 }
@@ -673,7 +682,8 @@ impl<'a> Work<'a> {
                     // Not dirty; go directly to the Done state.
                     self.ready_dependents(id);
                 } else {
-                    self.build_states.enqueue(id, self.graph.build(id))?;
+                    self.build_states
+                        .enqueue(self.graph, id, self.graph.build(id))?;
                 }
                 made_progress = true;
             }
@@ -697,7 +707,7 @@ impl<'a> Work<'a> {
             let build = self.graph.build(task.buildid);
             trace::if_enabled(|t| {
                 let desc = progress::build_message(build);
-                t.write_complete(desc, task.tid + 1, task.span.0, task.span.1);
+                t.write_complete(&desc, task.tid + 1, task.span.0, task.span.1);
             });
 
             self.progress
@@ -730,6 +740,8 @@ impl<'a> Work<'a> {
 
 #[cfg(test)]
 mod tests {
+    use crate::byte_string::BorrowedBytes;
+
     #[test]
     fn build_cycle() -> Result<(), anyhow::Error> {
         let file = "
@@ -737,8 +749,8 @@ build a: phony b
 build b: phony c
 build c: phony a
 ";
-        let mut graph = crate::load::parse("build.ninja".to_string(), file.as_bytes().to_vec())?;
-        let a_id = graph.file_id(&mut "a".to_string());
+        let mut graph = crate::load::parse("build.ninja", file.to_byte_string())?;
+        let a_id = graph.file_id("a");
         let mut states = crate::work::BuildStates::new(graph.builds.next_id(), vec![]);
         let mut stack = Vec::new();
         match states.want_file(&graph, &mut stack, a_id) {

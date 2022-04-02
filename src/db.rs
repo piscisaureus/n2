@@ -11,6 +11,7 @@ use crate::graph::Hashes;
 use serde_derive::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::ffi::OsString;
 use std::fs;
 use std::io::{BufReader, BufWriter, Write};
 
@@ -64,7 +65,7 @@ impl Writer {
                 let id = self.ids.file_ids.push(file_id);
                 self.ids.db_ids.insert(file_id, id);
 
-                let entry = DbEntry::File(graph.file(file_id).name.to_owned());
+                let entry = DbEntry::File((&*graph.file(file_id).name).to_owned());
                 serde_cbor::ser::to_writer(&mut self.w, &entry)?;
 
                 id
@@ -111,8 +112,8 @@ pub fn open(path: &str, graph: &mut Graph, hashes: &mut Hashes) -> anyhow::Resul
             Some(Err(err)) => return Err(err.into()),
         };
         match entry {
-            DbEntry::File(mut name) => {
-                let file_id = graph.file_id(&mut name);
+            DbEntry::File(name) => {
+                let file_id = graph.file_id(name);
                 let db_id = ids.file_ids.push(file_id);
                 ids.db_ids.insert(file_id, db_id);
             }
@@ -146,7 +147,7 @@ pub fn open(path: &str, graph: &mut Graph, hashes: &mut Hashes) -> anyhow::Resul
 #[derive(Serialize, Deserialize)]
 enum DbEntry {
     #[serde(rename = "f")]
-    File(String),
+    File(OsString),
 
     #[serde(rename = "b")]
     Build {
