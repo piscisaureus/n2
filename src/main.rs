@@ -101,6 +101,7 @@ fn run() -> anyhow::Result<i32> {
     let mut parallelism = usize::from(std::thread::available_parallelism()?);
 
     let mut opts = getopts::Options::new();
+    opts.optflag("", "loop", "loop");
     opts.optopt("C", "", "chdir before running", "DIR");
     opts.optopt("d", "debug", "debugging tools", "TOOL");
     opts.optopt(
@@ -157,12 +158,19 @@ fn run() -> anyhow::Result<i32> {
 
     let mut progress = ConsoleProgress::new(matches.opt_present("v"), use_fancy_terminal());
 
-    // Build once with regen=true, and if the result says we regenerated the
-    // build file, reload and build everything a second time.
-    let mut result = build(&mut progress, parallelism, true, &matches.free)?;
-    if let BuildResult::Regen = result {
-        result = build(&mut progress, parallelism, false, &matches.free)?;
-    }
+    let loop_flag = matches.opt_present("loop");
+
+    let result = loop {
+        // Build once with regen=true, and if the result says we regenerated the
+        // build file, reload and build everything a second time.
+        let mut result = build(&mut progress, parallelism, true, &matches.free)?;
+        if let BuildResult::Regen = result {
+            result = build(&mut progress, parallelism, false, &matches.free)?;
+        }
+        if !loop_flag {
+            break result;
+        }
+    };
 
     match result {
         BuildResult::Regen => panic!("should not happen"),
