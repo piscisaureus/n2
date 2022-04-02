@@ -1,14 +1,22 @@
 //! Graph loading: runs .ninja parsing and constructs the build graph from it.
 
-use crate::byte_string::*;
-use crate::graph::{FileId, RspFile};
-use crate::parse::Statement;
-use crate::{db, eval, graph, parse, trace};
-use anyhow::{anyhow, bail};
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use std::ffi::OsStr;
+use std::ffi::OsString;
+
+use anyhow::anyhow;
+use anyhow::bail;
+
+use crate::byte_string::*;
+use crate::db;
+use crate::eval;
+use crate::graph;
+use crate::graph::FileId;
+use crate::graph::RspFile;
+use crate::parse;
+use crate::parse::Statement;
+use crate::trace;
 
 /// A variable lookup environment for magic $in/$out variables.
 struct BuildImplicitVars<'a> {
@@ -60,7 +68,7 @@ struct Loader {
 
 impl parse::Loader for Loader {
     type Path = FileId;
-    fn path(&mut self, path_buf: PathBuf) -> Self::Path {
+    fn path(&mut self, path_buf: OsString) -> Self::Path {
         self.graph.file_id(path_buf)
     }
 }
@@ -83,7 +91,7 @@ impl Loader {
 
     fn add_build<'a>(
         &mut self,
-        filename: Rc<PathBuf>,
+        file_id: FileId,
         env: &eval::Vars<'a>,
         b: parse::Build<FileId>,
     ) -> anyhow::Result<()> {
@@ -99,7 +107,7 @@ impl Loader {
         };
         let mut build = graph::Build::new(
             graph::FileLoc {
-                filename,
+                path: file_id,
                 line: b.line,
             },
             ins,
@@ -132,7 +140,7 @@ impl Loader {
             .map(ByteString::into_os_string)
             .transpose()?;
         let depfile = lookup(b"depfile")
-            .map(ByteString::into_path_buf)
+            .map(ByteString::into_os_string)
             .transpose()?;
 
         let rspfile_path = lookup(b"rspfile");
@@ -140,7 +148,7 @@ impl Loader {
         let rspfile = match (rspfile_path, rspfile_content) {
             (None, None) => None,
             (Some(path), Some(content)) => Some(RspFile {
-                path: path.into_path_buf()?,
+                path: path.into_os_string()?,
                 content,
             }),
             _ => bail!("rspfile and rspfile_content need to be both specified"),
@@ -156,8 +164,8 @@ impl Loader {
         Ok(())
     }
 
-    fn file_name(&self, id: FileId) -> &Path {
-        &**self.graph.file(id).name
+    fn file_name(&self, id: FileId) -> &OsStr {
+        &self.graph.file(id).name
     }
 
     fn read_file(&mut self, id: FileId) -> anyhow::Result<()> {
@@ -189,9 +197,7 @@ impl Loader {
                 Statement::Rule(rule) => {
                     self.rules.insert(rule.name.to_owned(), rule.vars);
                 }
-                Statement::Build(build) => {
-                    self.add_build(Rc::clone(&self.graph.file(id).name), &parser.vars, build)?
-                }
+                Statement::Build(build) => self.add_build(id, &parser.vars, build)?,
                 Statement::Pool(pool) => {
                     self.pools.push((pool.name.to_owned(), pool.depth));
                 }
@@ -214,7 +220,7 @@ pub struct State {
 pub fn read() -> anyhow::Result<State> {
     let mut loader = Loader::new();
     trace::scope("loader.read_file", || {
-        let id = loader.graph.file_id("build.ninja".to_owned());
+        let id = loader.graph.file_id("build.ninja");
         loader.read_file(id)
     })?;
     let mut hashes = graph::Hashes::new();
@@ -233,7 +239,7 @@ pub fn read() -> anyhow::Result<State> {
 
 /// Parse a single file's content.
 #[cfg(test)]
-pub fn parse(path: impl AsRef<Path>, content: ByteString) -> anyhow::Result<graph::Graph> {
+pub fn parse(path: impl AsRef<OsStr>, content: ByteString) -> anyhow::Result<graph::Graph> {
     let mut loader = Loader::new();
     let id = loader.graph.file_id(path.as_ref());
     trace::scope("loader.parse", || loader.parse(id, content))?;

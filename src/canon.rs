@@ -1,10 +1,11 @@
 //! Path canonicalization.
 
-use crate::byte_string::*;
+use std::ffi::OsString;
 use std::mem::replace;
 use std::mem::take;
 use std::mem::MaybeUninit;
-use std::path::PathBuf;
+
+use crate::byte_string::*;
 
 /// An on-stack stack of values.
 /// Used for tracking locations of parent components within a path.
@@ -45,7 +46,7 @@ impl<T: Copy> StackStack<T> {
 /// Does not access the disk, but only simplifies things like
 /// "foo/./bar" => "foo/bar".
 /// These paths can show up due to variable expansion in particular.
-pub fn canon_path_in_place(path_buf: &mut PathBuf) {
+pub fn canon_path_in_place(path_buf: &mut OsString) {
     let mut byte_buf = take(path_buf).into_byte_string();
 
     // Safety: this traverses the path buffer to move data around.
@@ -130,12 +131,12 @@ pub fn canon_path_in_place(path_buf: &mut PathBuf) {
 
         byte_buf.set_len(dst.offset_from(byte_buf.as_ptr()) as usize);
 
-        let temp = replace(path_buf, byte_buf.into_path_buf().unwrap());
-        assert_eq!(temp, PathBuf::default());
+        let temp = replace(path_buf, byte_buf.into_os_string().unwrap());
+        assert!(temp.is_empty());
     }
 }
 
-pub fn canon_path(path: impl Into<PathBuf>) -> PathBuf {
+pub fn canon_path(path: impl Into<OsString>) -> OsString {
     let mut path_buf = path.into();
     canon_path_in_place(&mut path_buf);
     path_buf
@@ -143,33 +144,35 @@ pub fn canon_path(path: impl Into<PathBuf>) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
+
     use super::*;
 
     #[test]
     fn noop() {
-        assert_eq!(canon_path("foo"), PathBuf::from("foo"));
-        assert_eq!(canon_path("foo/bar"), PathBuf::from("foo/bar"));
+        assert_eq!(canon_path("foo"), OsStr::new("foo"));
+        assert_eq!(canon_path("foo/bar"), OsStr::new("foo/bar"));
     }
 
     #[test]
     fn dot() {
-        assert_eq!(canon_path("./foo"), PathBuf::from("foo"));
-        assert_eq!(canon_path("foo/."), PathBuf::from("foo/"));
-        assert_eq!(canon_path("foo/./bar"), PathBuf::from("foo/bar"));
+        assert_eq!(canon_path("./foo"), OsStr::new("foo"));
+        assert_eq!(canon_path("foo/."), OsStr::new("foo/"));
+        assert_eq!(canon_path("foo/./bar"), OsStr::new("foo/bar"));
     }
 
     #[test]
     fn slash() {
-        assert_eq!(canon_path("/foo"), PathBuf::from("/foo"));
-        assert_eq!(canon_path("foo//bar"), PathBuf::from("foo/bar"));
+        assert_eq!(canon_path("/foo"), OsStr::new("/foo"));
+        assert_eq!(canon_path("foo//bar"), OsStr::new("foo/bar"));
     }
 
     #[test]
     fn parent() {
-        assert_eq!(canon_path("foo/../bar"), PathBuf::from("bar"));
-        assert_eq!(canon_path("/foo/../bar"), PathBuf::from("/bar"));
-        assert_eq!(canon_path("../foo"), PathBuf::from("../foo"));
-        assert_eq!(canon_path("../foo/../bar"), PathBuf::from("../bar"));
-        assert_eq!(canon_path("../../bar"), PathBuf::from("../../bar"));
+        assert_eq!(canon_path("foo/../bar"), OsStr::new("bar"));
+        assert_eq!(canon_path("/foo/../bar"), OsStr::new("/bar"));
+        assert_eq!(canon_path("../foo"), OsStr::new("../foo"));
+        assert_eq!(canon_path("../foo/../bar"), OsStr::new("../bar"));
+        assert_eq!(canon_path("../../bar"), OsStr::new("../../bar"));
     }
 }

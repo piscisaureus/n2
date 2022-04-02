@@ -1,12 +1,13 @@
 extern crate getopts;
 
+use std::ffi::OsStr;
+use std::path::Path;
+
 use anyhow::anyhow;
 use n2::load;
 use n2::progress::ConsoleProgress;
 use n2::trace;
 use n2::work;
-use std::ffi::OsStr;
-use std::path::Path;
 
 // The result of starting a build.
 enum BuildResult {

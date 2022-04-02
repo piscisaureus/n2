@@ -5,22 +5,26 @@
 //! The threads might be relatively cheap(?) because they just block on
 //! the subprocesses though?
 
-use crate::byte_string::*;
-use crate::depfile;
-use crate::graph::{BuildId, RspFile};
-use crate::scanner::Scanner;
-use anyhow::{anyhow, bail};
 use std::ffi::OsStr;
 use std::ffi::OsString;
-use std::io::Write;
 use std::path::Path;
-use std::path::PathBuf;
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use std::time::Instant;
+
+use anyhow::anyhow;
+use anyhow::bail;
+
+use crate::byte_string::*;
+use crate::depfile;
+use crate::graph::BuildId;
+use crate::graph::RspFile;
+use crate::scanner::Scanner;
 
 #[cfg(unix)]
+use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
-
 #[cfg(unix)]
 use std::sync::Mutex;
 
@@ -41,12 +45,12 @@ pub struct TaskResult {
     pub success: bool,
     /// Console output.
     pub output: ByteString,
-    pub discovered_deps: Option<Vec<PathBuf>>,
+    pub discovered_deps: Option<Vec<OsString>>,
 }
 
 /// Reads dependencies from a .d file path.
-fn read_depfile(path: impl AsRef<Path>) -> anyhow::Result<Vec<PathBuf>> {
-    let mut bytes = match std::fs::read(&path) {
+fn read_depfile(path: impl AsRef<OsStr>) -> anyhow::Result<Vec<OsString>> {
+    let mut bytes = match std::fs::read(path.as_ref()) {
         Ok(b) => b,
         Err(e) => bail!("read {:?}: {}", path.as_ref(), e),
     };
@@ -63,7 +67,7 @@ fn read_depfile(path: impl AsRef<Path>) -> anyhow::Result<Vec<PathBuf>> {
 }
 
 fn write_rspfile(rspfile: &RspFile) -> anyhow::Result<()> {
-    if let Some(parent) = rspfile.path.parent() {
+    if let Some(parent) = Path::parent(rspfile.path.as_ref()) {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(&rspfile.path, &rspfile.content)?;
@@ -74,7 +78,7 @@ fn write_rspfile(rspfile: &RspFile) -> anyhow::Result<()> {
 /// Returns an Err() if we failed outside of the process itself.
 fn run_task(
     cmdline: &OsStr,
-    depfile: Option<&Path>,
+    depfile: Option<&OsStr>,
     rspfile: Option<&RspFile>,
 ) -> anyhow::Result<TaskResult> {
     if let Some(rspfile) = rspfile {
@@ -163,7 +167,7 @@ fn zeroed_process_information() -> winapi::um::processthreadsapi::PROCESS_INFORM
 }
 
 #[cfg(windows)]
-fn run_command(cmdline: &bstr) -> anyhow::Result<TaskResult> {
+fn run_command(cmdline: &OsStr) -> anyhow::Result<TaskResult> {
     // Don't want to run `cmd /c` since that limits cmd line length to 8192 bytes.
     // std::process::Command can't take a string and pass it through to CreateProcess unchanged,
     // so call that ourselves.
@@ -177,13 +181,13 @@ fn run_command(cmdline: &bstr) -> anyhow::Result<TaskResult> {
 
     let mut process_info = zeroed_process_information();
 
-    let mut mut_cmdline = cmdline.to_owned();
-    mut_cmdline.push(b"\0");
+    let cmdline_ffi = std::ffi::CString::new(cmdline.to_byte_string())?;
+    let cmdline_ptr = cmdline_ffi.as_ptr() as *mut _;
 
     let create_process_success = unsafe {
         winapi::um::processthreadsapi::CreateProcessA(
             std::ptr::null_mut(),
-            mut_cmdline.as_mut_ptr() as *mut i8,
+            cmdline_ptr,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             /*inherit handles = */ winapi::shared::ntdef::TRUE.into(),
@@ -295,7 +299,7 @@ impl Runner {
         &mut self,
         id: BuildId,
         cmdline: OsString,
-        depfile: Option<PathBuf>,
+        depfile: Option<OsString>,
         rspfile: Option<RspFile>,
     ) {
         let tid = self.tids.claim();

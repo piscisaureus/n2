@@ -5,10 +5,17 @@
 //! To avoid allocations parsing frequently uses references into the input
 //! text, marked with the lifetime `'text`.
 
+use std::ffi::OsStr;
+use std::ffi::OsString;
+
 use crate::byte_string::*;
-use crate::eval::{EvalPart, EvalString, LazyVars, Vars};
-use crate::scanner::{ParseError, ParseResult, Scanner};
-use std::path::{Path, PathBuf};
+use crate::eval::EvalPart;
+use crate::eval::EvalString;
+use crate::eval::LazyVars;
+use crate::eval::Vars;
+use crate::scanner::ParseError;
+use crate::scanner::ParseResult;
+use crate::scanner::Scanner;
 
 #[derive(Debug)]
 pub struct Rule<'text> {
@@ -64,7 +71,7 @@ fn is_path_char(c: u8) -> bool {
 
 pub trait Loader {
     type Path;
-    fn path(&mut self, path_buf: PathBuf) -> Self::Path;
+    fn path(&mut self, path_buf: OsString) -> Self::Path;
 }
 
 impl<'text> Parser<'text> {
@@ -75,7 +82,7 @@ impl<'text> Parser<'text> {
         }
     }
 
-    pub fn format_parse_error(&self, filename: impl AsRef<Path>, err: ParseError) -> String {
+    pub fn format_parse_error(&self, filename: impl AsRef<OsStr>, err: ParseError) -> String {
         self.scanner.format_parse_error(filename, err)
     }
 
@@ -341,8 +348,8 @@ impl<'text> Parser<'text> {
         if byte_buf.is_empty() {
             Ok(None)
         } else {
-            let path_buf = byte_buf.into_path_buf()?;
-            Ok(Some(loader.path(path_buf)))
+            let file_id = loader.path(byte_buf.into_os_string()?);
+            Ok(Some(file_id))
         }
     }
 
@@ -378,8 +385,8 @@ impl<'text> Parser<'text> {
 
 struct StringLoader {}
 impl Loader for StringLoader {
-    type Path = PathBuf;
-    fn path(&mut self, path_buf: PathBuf) -> Self::Path {
+    type Path = OsString;
+    fn path(&mut self, path_buf: OsString) -> Self::Path {
         path_buf
     }
 }
@@ -401,7 +408,10 @@ default a b$var c
             Statement::Default(d) => d,
             s => panic!("expected default, got {:?}", s),
         };
-        assert_eq!(default, &[Path::new("a"), Path::new("b3"), Path::new("c")]);
+        assert_eq!(
+            default,
+            &[OsStr::new("a"), OsStr::new("b3"), OsStr::new("c")]
+        );
         println!("{:?}", default);
     }
 }

@@ -1,20 +1,20 @@
 //! Build runner, choosing and executing tasks as determined by out of date inputs.
 
+use std::collections::HashSet;
+use std::collections::VecDeque;
+use std::path::Path;
+use std::time::Duration;
+
 use crate::byte_string::*;
 use crate::db;
 use crate::densemap::DenseMap;
 use crate::graph::*;
 use crate::progress;
 use crate::progress::Progress;
-use crate::task;
-use crate::trace;
-use std::collections::HashSet;
-use std::collections::VecDeque;
-use std::path::Path;
-use std::time::Duration;
-
 #[cfg(unix)]
 use crate::signal;
+use crate::task;
+use crate::trace;
 
 /// Build steps go through this sequence of states.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -233,9 +233,9 @@ impl BuildStates {
         if let Some(cycle) = stack.iter().position(|&sid| sid == id) {
             let mut err = "dependency cycle: ".to_owned();
             for &id in stack[cycle..].iter() {
-                err.push_str(&format!("{} -> ", graph.file(id).name.display()));
+                err.push_str(&format!("{} -> ", graph.file(id).name.as_str_lossy()));
             }
-            err.push_str(&graph.file(id).name.to_string_lossy());
+            err.push_str(&graph.file(id).name.as_str_lossy());
             anyhow::bail!(err);
         }
 
@@ -270,12 +270,12 @@ impl BuildStates {
 
     /// Mark a build as ready to run.
     /// May fail if the build references an unknown pool.
-    pub fn enqueue(&mut self, id: BuildId, build: &Build) -> anyhow::Result<()> {
+    pub fn enqueue(&mut self, graph: &Graph, id: BuildId, build: &Build) -> anyhow::Result<()> {
         self.set(id, build, BuildState::Queued);
         let pool = self.get_pool(build).ok_or_else(|| {
             anyhow::anyhow!(
                 "{}: unknown pool {:?}",
-                build.location,
+                build.location.fill(graph),
                 // Unnamed pool lookups always succeed, this error is about
                 // named pools.
                 build.pool.as_ref().unwrap()
@@ -350,7 +350,7 @@ impl<'a> Work<'a> {
     pub fn want_file(&mut self, name: impl AsRef<Path>) -> anyhow::Result<()> {
         let name = name.as_ref();
         let target = match self.graph.lookup_file_id(name) {
-            None => anyhow::bail!("unknown path requested: {}", name.display()),
+            None => anyhow::bail!("unknown path requested: {}", name.as_str_lossy()),
             Some(id) => id,
         };
         self.want_fileid(target)
@@ -401,8 +401,8 @@ impl<'a> Work<'a> {
                         // file and wouldn't get here.
                         anyhow::bail!(
                             "{} used generated file {}, but has no dependency path to it",
-                            build.location,
-                            file.name.display()
+                            build.location.fill(self.graph),
+                            file.name.as_str_lossy()
                         );
                     }
                     self.file_state.restat(id, &file.name)?
@@ -433,8 +433,8 @@ impl<'a> Work<'a> {
             if let Some(missing) = self.ensure_discovered_stats(id)? {
                 anyhow::bail!(
                     "{} depfile references nonexistent {}",
-                    self.graph.build(id).location,
-                    self.graph.file(missing).name.display()
+                    self.graph.build(id).location.fill(self.graph),
+                    self.graph.file(missing).name.as_str_lossy()
                 );
             }
         }
@@ -524,8 +524,8 @@ impl<'a> Work<'a> {
                             // already have been visited by this point.
                             panic!(
                                 "{}: should already have file state for generated input {}",
-                                build.location,
-                                &file.name.display()
+                                build.location.fill(self.graph),
+                                &file.name.as_str_lossy()
                             );
                         }
                         self.file_state.restat(id, &file.name)?
@@ -535,7 +535,11 @@ impl<'a> Work<'a> {
                     if workaround_missing_phony_deps {
                         continue;
                     }
-                    anyhow::bail!("{}: input {} missing", build.location, file.name.display());
+                    anyhow::bail!(
+                        "{}: input {} missing",
+                        build.location.fill(self.graph),
+                        file.name.as_str_lossy()
+                    );
                 }
             }
 
@@ -555,7 +559,11 @@ impl<'a> Work<'a> {
                     if workaround_missing_phony_deps {
                         continue;
                     }
-                    anyhow::bail!("{}: input {} missing", build.location, file.name.display());
+                    anyhow::bail!(
+                        "{}: input {} missing",
+                        build.location.fill(self.graph),
+                        file.name.as_str_lossy()
+                    );
                 }
             }
         }
@@ -575,7 +583,7 @@ impl<'a> Work<'a> {
         for &id in self.graph.build(id).outs() {
             let file = self.graph.file(id);
             if self.file_state.get(id).is_some() {
-                panic!("expected no file state for {}", file.name.display());
+                panic!("expected no file state for {}", file.name.as_str_lossy());
             }
             let mtime = self.file_state.restat(id, &file.name)?;
             if mtime == MTime::Missing {
@@ -619,7 +627,7 @@ impl<'a> Work<'a> {
     fn create_parent_dirs(&self, ids: &[FileId]) -> anyhow::Result<()> {
         let mut dirs: Vec<&std::path::Path> = Vec::new();
         for &out in ids {
-            if let Some(parent) = std::path::Path::new(&**self.graph.file(out).name).parent() {
+            if let Some(parent) = std::path::Path::new(&*self.graph.file(out).name).parent() {
                 if dirs.iter().any(|&p| p == parent) {
                     continue;
                 }
@@ -674,7 +682,8 @@ impl<'a> Work<'a> {
                     // Not dirty; go directly to the Done state.
                     self.ready_dependents(id);
                 } else {
-                    self.build_states.enqueue(id, self.graph.build(id))?;
+                    self.build_states
+                        .enqueue(self.graph, id, self.graph.build(id))?;
                 }
                 made_progress = true;
             }

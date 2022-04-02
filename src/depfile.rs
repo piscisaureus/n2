@@ -1,17 +1,18 @@
 //! Parsing of Makefile syntax as found in `.d` files emitted by C compilers.
 
+use std::ffi::OsStr;
+
 use crate::byte_string::*;
 use crate::scanner::ParseResult;
 use crate::scanner::Scanner;
-use std::path::Path;
 
 /// Dependency information for a single target.
 #[derive(Debug)]
 pub struct Deps<'a> {
     /// Output name, as found in the `.d` input.
-    pub target: &'a Path,
+    pub target: &'a OsStr,
     /// Input names, as found in the `.d` input.
-    pub deps: Vec<&'a Path>,
+    pub deps: Vec<&'a OsStr>,
 }
 
 /// Skip spaces and backslashed newlines.
@@ -33,7 +34,7 @@ fn skip_spaces(scanner: &mut Scanner) -> ParseResult<()> {
 }
 
 /// Read one path from the input scanner.
-fn read_path<'a>(scanner: &mut Scanner<'a>) -> ParseResult<Option<&'a Path>> {
+fn read_path<'a>(scanner: &mut Scanner<'a>) -> ParseResult<Option<&'a OsStr>> {
     skip_spaces(scanner)?;
     let start = scanner.ofs;
     loop {
@@ -56,7 +57,7 @@ fn read_path<'a>(scanner: &mut Scanner<'a>) -> ParseResult<Option<&'a Path>> {
         return Ok(None);
     }
     let slice = scanner.slice(start, end);
-    let path = slice.as_path()?;
+    let path = slice.as_os_str()?;
     Ok(Some(path))
 }
 
@@ -98,7 +99,7 @@ mod tests {
         let mut file = b"build/browse.o: src/browse.cc src/browse.h build/browse_py.h\n".to_vec();
         let deps = must_parse(&mut file);
         println!("{:?}", deps);
-        assert_eq!(deps.target, Path::new("build/browse.o"));
+        assert_eq!(deps.target, OsStr::new("build/browse.o"));
         assert_eq!(deps.deps.len(), 3);
     }
 
@@ -106,7 +107,7 @@ mod tests {
     fn test_parse_space_suffix() {
         let mut file = b"build/browse.o: src/browse.cc   ".to_vec();
         let deps = must_parse(&mut file);
-        assert_eq!(deps.target, Path::new("build/browse.o"));
+        assert_eq!(deps.target, OsStr::new("build/browse.o"));
         assert_eq!(deps.deps.len(), 1);
     }
 
@@ -114,7 +115,7 @@ mod tests {
     fn test_parse_multiline() {
         let mut file = b"build/browse.o: src/browse.cc\\\n  build/browse_py.h".to_vec();
         let deps = must_parse(&mut file);
-        assert_eq!(deps.target, Path::new("build/browse.o"));
+        assert_eq!(deps.target, OsStr::new("build/browse.o"));
         assert_eq!(deps.deps.len(), 2);
     }
 
@@ -122,7 +123,7 @@ mod tests {
     fn test_parse_without_final_newline() {
         let mut file = b"build/browse.o: src/browse.cc".to_vec();
         let deps = must_parse(&mut file);
-        assert_eq!(deps.target, Path::new("build/browse.o"));
+        assert_eq!(deps.target, OsStr::new("build/browse.o"));
         assert_eq!(deps.deps.len(), 1);
     }
 }

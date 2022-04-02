@@ -1,6 +1,19 @@
 //! The n2 database stores information about previous builds for determining
 //! which files are up to date.
 
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::fs;
+use std::io::BufReader;
+use std::io::BufWriter;
+use std::io::Write;
+
+use serde_derive::Deserialize;
+use serde_derive::Serialize;
+
+use crate::byte_string::BorrowedBytes;
+use crate::byte_string::ByteString;
+use crate::byte_string::OwnedBytes;
 use crate::densemap;
 use crate::densemap::DenseMap;
 use crate::graph::BuildId;
@@ -8,12 +21,6 @@ use crate::graph::FileId;
 use crate::graph::Graph;
 use crate::graph::Hash;
 use crate::graph::Hashes;
-use serde_derive::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::collections::HashSet;
-use std::fs;
-use std::io::{BufReader, BufWriter, Write};
-use std::path::PathBuf;
 
 /// Files are identified by integers that are stable across n2 executions.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -65,7 +72,7 @@ impl Writer {
                 let id = self.ids.file_ids.push(file_id);
                 self.ids.db_ids.insert(file_id, id);
 
-                let entry = DbEntry::File((&*graph.file(file_id).name).to_owned());
+                let entry = DbEntry::File((&*graph.file(file_id).name).to_byte_string());
                 serde_cbor::ser::to_writer(&mut self.w, &entry)?;
 
                 id
@@ -113,7 +120,7 @@ pub fn open(path: &str, graph: &mut Graph, hashes: &mut Hashes) -> anyhow::Resul
         };
         match entry {
             DbEntry::File(name) => {
-                let file_id = graph.file_id(name);
+                let file_id = graph.file_id(name.into_os_string()?);
                 let db_id = ids.file_ids.push(file_id);
                 ids.db_ids.insert(file_id, db_id);
             }
@@ -146,8 +153,8 @@ pub fn open(path: &str, graph: &mut Graph, hashes: &mut Hashes) -> anyhow::Resul
 
 #[derive(Serialize, Deserialize)]
 enum DbEntry {
-    #[serde(rename = "f")]
-    File(PathBuf),
+    #[serde(rename = "f", with = "serde_bytes")]
+    File(ByteString),
 
     #[serde(rename = "b")]
     Build {

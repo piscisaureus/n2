@@ -1,9 +1,10 @@
 //! Scans an input string (source file) character by character.
 
-use crate::byte_string::*;
-use std::path::Path;
+use std::ffi::OsStr;
 use std::str::Utf8Error;
 use std::string::FromUtf8Error;
+
+use crate::byte_string::*;
 
 #[derive(Debug)]
 pub struct ParseError {
@@ -103,7 +104,7 @@ impl<'a> Scanner<'a> {
         })
     }
 
-    pub fn format_parse_error(&self, filename: impl AsRef<Path>, err: ParseError) -> String {
+    pub fn format_parse_error(&self, filename: impl AsRef<OsStr>, err: ParseError) -> String {
         let filename = filename.as_ref();
         let mut ofs = 0;
         let lines = self.buf.split(|&c| c == b'\n');
@@ -113,7 +114,7 @@ impl<'a> Scanner<'a> {
                 msg.push_str(err.msg.as_str());
                 msg.push('\n');
 
-                let prefix = format!("{}:{}: ", filename.display(), line_number + 1);
+                let prefix = format!("{}:{}: ", filename.as_str_lossy(), line_number + 1);
                 msg.push_str(&prefix);
 
                 let context = String::from_utf8_lossy(line);

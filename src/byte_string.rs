@@ -1,8 +1,11 @@
 use std::alloc::Layout;
+use std::borrow::Borrow;
+use std::borrow::Cow;
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::mem::ManuallyDrop;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 use std::str::Utf8Error;
 use std::string::FromUtf8Error;
 
@@ -10,7 +13,9 @@ pub type ByteString = Vec<u8>;
 #[allow(non_camel_case_types)]
 pub type bstr = [u8];
 
-pub trait OwnedBytes: Sized {
+pub trait OwnedBytes: Borrow<Self::Slice> + Sized {
+    type Slice: BorrowedBytes + ?Sized;
+
     fn into_byte_string(self) -> Vec<u8> {
         // This is safe because all "string" types are really just wrappers
         // around `Vec<u8>`. We need this hack because on Windows, Rust
@@ -44,6 +49,10 @@ pub trait OwnedBytes: Sized {
         let s = self.into_os_string()?;
         let s = PathBuf::from(s);
         Ok(s)
+    }
+
+    fn to_string_lossy(&self) -> String {
+        Borrow::<Self::Slice>::borrow(self).as_str_lossy().into()
     }
 }
 
@@ -99,6 +108,11 @@ pub trait BorrowedBytes {
         Ok(s.to_owned())
     }
 
+    fn as_str_lossy(&self) -> Cow<str> {
+        let b = self.as_bstr();
+        String::from_utf8_lossy(b)
+    }
+
     // Note that there is no `as_bytes_mut()` method, since this cannot be
     // done safely. Mutating the underlying bytes might invalidate invariants
     // that need to be upheld, namely that `String`s contain only valid UTF-8,
@@ -108,10 +122,18 @@ pub trait BorrowedBytes {
 // `OsString` and `PathBuf` are really just wrappers around `Vec<u8>`. However
 // Rust doesn't allow us access to the raw bytes on Windows because it somehow
 // believes WTF-8 encoded strings should not be accessible.
-impl OwnedBytes for ByteString {}
-impl OwnedBytes for String {}
-impl OwnedBytes for OsString {}
-impl OwnedBytes for PathBuf {}
+impl OwnedBytes for ByteString {
+    type Slice = bstr;
+}
+impl OwnedBytes for String {
+    type Slice = str;
+}
+impl OwnedBytes for OsString {
+    type Slice = OsStr;
+}
+impl OwnedBytes for PathBuf {
+    type Slice = Path;
+}
 
 // `OsStr` and `Path` are really just wrappers around `[u8]`.
 impl BorrowedBytes for bstr {}

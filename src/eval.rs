@@ -1,9 +1,11 @@
 //! Represents parsed Ninja strings with embedded variable references, e.g.
 //! `c++ $in -o $out`, and mechanisms for expanding those into plain strings.
 
-use crate::byte_string::*;
-use std::borrow::{Cow, ToOwned};
+use std::borrow::Cow;
+use std::borrow::ToOwned;
 use std::collections::HashMap;
+
+use crate::byte_string::*;
 
 /// An environment providing a mapping of variable name to variable value.
 /// A given EvalString may be expanded with multiple environments as possible

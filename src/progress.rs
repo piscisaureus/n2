@@ -1,7 +1,6 @@
 //! Build progress tracking and reporting, for the purpose of display to the
 //! user.
 
-use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::io::Write;
 use std::time::Duration;
@@ -30,7 +29,8 @@ pub fn get_terminal_cols() -> Option<usize> {
 pub fn get_terminal_cols() -> Option<usize> {
     extern crate winapi;
     extern crate kernel32;
-    use kernel32::{GetConsoleScreenBufferInfo, GetStdHandle};
+    use kernel32::GetConsoleScreenBufferInfo;
+    use kernel32::GetStdHandle;
     let console = unsafe { GetStdHandle(winapi::um::winbase::STD_OUTPUT_HANDLE) };
     if console == winapi::um::handleapi::INVALID_HANDLE_VALUE {
         return None;
@@ -45,9 +45,9 @@ pub fn get_terminal_cols() -> Option<usize> {
 }
 
 /// Compute the message to display on the console for a given build.
-pub fn build_message(build: &Build) -> Cow<str> {
+pub fn build_message(build: &Build) -> String {
     if let Some(desc) = &build.desc {
-        String::from_utf8_lossy(desc)
+        desc.to_string_lossy()
     } else if let Some(cmdline) = &build.cmdline {
         cmdline.to_string_lossy()
     } else {
@@ -135,7 +135,7 @@ impl Progress for ConsoleProgress {
                 self.tasks.push_back(Task {
                     id,
                     start: Instant::now(),
-                    message: message.into(),
+                    message,
                 });
             }
             BuildState::Done => {
