@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
 use std::io::{BufReader, BufWriter, Write};
+use std::path::PathBuf;
 
 /// Files are identified by integers that are stable across n2 executions.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -64,7 +65,7 @@ impl Writer {
                 let id = self.ids.file_ids.push(file_id);
                 self.ids.db_ids.insert(file_id, id);
 
-                let entry = DbEntry::File(graph.file(file_id).name.to_owned());
+                let entry = DbEntry::File((&*graph.file(file_id).name).to_owned());
                 serde_cbor::ser::to_writer(&mut self.w, &entry)?;
 
                 id
@@ -111,8 +112,8 @@ pub fn open(path: &str, graph: &mut Graph, hashes: &mut Hashes) -> anyhow::Resul
             Some(Err(err)) => return Err(err.into()),
         };
         match entry {
-            DbEntry::File(mut name) => {
-                let file_id = graph.file_id(&mut name);
+            DbEntry::File(name) => {
+                let file_id = graph.file_id(name);
                 let db_id = ids.file_ids.push(file_id);
                 ids.db_ids.insert(file_id, db_id);
             }
@@ -146,7 +147,7 @@ pub fn open(path: &str, graph: &mut Graph, hashes: &mut Hashes) -> anyhow::Resul
 #[derive(Serialize, Deserialize)]
 enum DbEntry {
     #[serde(rename = "f")]
-    File(String),
+    File(PathBuf),
 
     #[serde(rename = "b")]
     Build {

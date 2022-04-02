@@ -1,11 +1,13 @@
 //! Build progress tracking and reporting, for the purpose of display to the
 //! user.
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::io::Write;
 use std::time::Duration;
 use std::time::Instant;
 
+use crate::byte_string::*;
 use crate::graph::Build;
 use crate::graph::BuildId;
 use crate::work::BuildState;
@@ -43,11 +45,14 @@ pub fn get_terminal_cols() -> Option<usize> {
 }
 
 /// Compute the message to display on the console for a given build.
-pub fn build_message(build: &Build) -> &str {
-    build
-        .desc
-        .as_ref()
-        .unwrap_or_else(|| build.cmdline.as_ref().unwrap())
+pub fn build_message(build: &Build) -> Cow<str> {
+    if let Some(desc) = &build.desc {
+        String::from_utf8_lossy(desc)
+    } else if let Some(cmdline) = &build.cmdline {
+        cmdline.to_string_lossy()
+    } else {
+        unreachable!()
+    }
 }
 
 /// Trait for build progress notifications.
@@ -66,7 +71,7 @@ pub trait Progress {
     /// TODO: maybe this should just be part of task_state?
     /// In particular, consider the case where builds output progress as they run,
     /// as well as the case where multiple build steps are allowed to fail.
-    fn completed(&mut self, build: &Build, success: bool, output: &[u8]);
+    fn completed(&mut self, build: &Build, success: bool, output: &bstr);
 
     /// Called when the overall build has completed (success or failure), to allow
     /// cleaning up the display.
@@ -119,7 +124,7 @@ impl ConsoleProgress {
 
 impl Progress for ConsoleProgress {
     fn update(&mut self, counts: &StateCounts) {
-        self.counts = counts.clone();
+        self.counts = *counts;
         self.maybe_print_progress();
     }
 
@@ -130,7 +135,7 @@ impl Progress for ConsoleProgress {
                 self.tasks.push_back(Task {
                     id,
                     start: Instant::now(),
-                    message: message.to_string(),
+                    message: message.into(),
                 });
             }
             BuildState::Done => {
@@ -146,7 +151,7 @@ impl Progress for ConsoleProgress {
         self.print_progress();
     }
 
-    fn completed(&mut self, build: &Build, success: bool, output: &[u8]) {
+    fn completed(&mut self, build: &Build, success: bool, output: &bstr) {
         // By default we don't want to print anything when a task completes,
         // but we do want to print the completed task when:
         // - failed tasks
@@ -155,7 +160,7 @@ impl Progress for ConsoleProgress {
         // - when the task had output (even in non-failing cases)
 
         let message = if self.verbose {
-            build.cmdline.as_ref().unwrap()
+            build.cmdline.as_ref().unwrap().to_string_lossy()
         } else {
             build_message(build)
         };

@@ -5,18 +5,20 @@
 //! To avoid allocations parsing frequently uses references into the input
 //! text, marked with the lifetime `'text`.
 
+use crate::byte_string::*;
 use crate::eval::{EvalPart, EvalString, LazyVars, Vars};
 use crate::scanner::{ParseError, ParseResult, Scanner};
+use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
 pub struct Rule<'text> {
-    pub name: &'text str,
+    pub name: &'text bstr,
     pub vars: LazyVars,
 }
 
 #[derive(Debug)]
 pub struct Build<'text, Path> {
-    pub rule: &'text str,
+    pub rule: &'text bstr,
     pub line: usize,
     pub outs: Vec<Path>,
     pub explicit_outs: usize,
@@ -29,7 +31,7 @@ pub struct Build<'text, Path> {
 
 #[derive(Debug)]
 pub struct Pool<'text> {
-    pub name: &'text str,
+    pub name: &'text bstr,
     pub depth: usize,
 }
 
@@ -46,38 +48,34 @@ pub enum Statement<'text, Path> {
 pub struct Parser<'text> {
     scanner: Scanner<'text>,
     pub vars: Vars<'text>,
-    /// Reading paths is very hot when parsing, so we always read into this buffer
-    /// and then immediately pass in to Loader::path() to canonicalize it in-place.
-    path_buf: String,
 }
 
 fn is_ident_char(c: u8) -> bool {
-    matches!(c as char, 'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '-' | '.' | '/' | ',' | '+' | '@')
+    matches!(c, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-' | b'.' | b'/' | b',' | b'+' | b'@')
 }
 
 fn is_path_char(c: u8) -> bool {
     // Basically any character is allowed in paths, but we want to parse e.g.
     //   build foo: bar | baz
-    // such that the colon is not part of the 'foo' path and such that '|' is
+    // such that the colon is not part of the 'foo' path and such that b'|' is
     // not read as a path.
-    !matches!(c as char, '\0' | ' ' | '\n' | ':' | '|' | '$')
+    !matches!(c, b'\0' | b' ' | b'\n' | b':' | b'|' | b'$')
 }
 
 pub trait Loader {
     type Path;
-    fn path(&mut self, path: &mut String) -> Self::Path;
+    fn path(&mut self, path_buf: PathBuf) -> Self::Path;
 }
 
 impl<'text> Parser<'text> {
-    pub fn new(buf: &'text mut Vec<u8>) -> Parser<'text> {
+    pub fn new(buf: &'text mut ByteString) -> Parser<'text> {
         Parser {
             scanner: Scanner::new(buf),
             vars: Vars::new(),
-            path_buf: String::with_capacity(64),
         }
     }
 
-    pub fn format_parse_error(&self, filename: &str, err: ParseError) -> String {
+    pub fn format_parse_error(&self, filename: impl AsRef<Path>, err: ParseError) -> String {
         self.scanner.format_parse_error(filename, err)
     }
 
@@ -87,34 +85,34 @@ impl<'text> Parser<'text> {
     ) -> ParseResult<Option<Statement<'text, L::Path>>> {
         loop {
             match self.scanner.peek() {
-                '\0' => return Ok(None),
-                '\n' => self.scanner.next(),
-                '#' => self.skip_comment()?,
-                ' ' | '\t' => return self.scanner.parse_error("unexpected whitespace"),
+                b'\0' => return Ok(None),
+                b'\n' => self.scanner.next(),
+                b'#' => self.skip_comment()?,
+                b' ' | b'\t' => return self.scanner.parse_error("unexpected whitespace"),
                 _ => {
                     let ident = self.read_ident()?;
                     self.scanner.skip_spaces();
                     match ident {
-                        "rule" => return Ok(Some(Statement::Rule(self.read_rule()?))),
-                        "build" => return Ok(Some(Statement::Build(self.read_build(loader)?))),
-                        "default" => {
+                        b"rule" => return Ok(Some(Statement::Rule(self.read_rule()?))),
+                        b"build" => return Ok(Some(Statement::Build(self.read_build(loader)?))),
+                        b"default" => {
                             return Ok(Some(Statement::Default(self.read_default(loader)?)))
                         }
-                        "include" => {
+                        b"include" => {
                             let id = match self.read_path(loader)? {
                                 None => return self.scanner.parse_error("expected path"),
                                 Some(p) => p,
                             };
                             return Ok(Some(Statement::Include(id)));
                         }
-                        "subninja" => {
+                        b"subninja" => {
                             let id = match self.read_path(loader)? {
                                 None => return self.scanner.parse_error("expected path"),
                                 Some(p) => p,
                             };
                             return Ok(Some(Statement::Subninja(id)));
                         }
-                        "pool" => return Ok(Some(Statement::Pool(self.read_pool()?))),
+                        b"pool" => return Ok(Some(Statement::Pool(self.read_pool()?))),
                         ident => {
                             let val = self.read_vardef()?.evaluate(&[&self.vars]);
                             self.vars.insert(ident, val);
@@ -125,16 +123,16 @@ impl<'text> Parser<'text> {
         }
     }
 
-    fn read_vardef(&mut self) -> ParseResult<EvalString<&'text str>> {
+    fn read_vardef(&mut self) -> ParseResult<EvalString<&'text bstr>> {
         self.scanner.skip_spaces();
-        self.scanner.expect('=')?;
+        self.scanner.expect(b'=')?;
         self.scanner.skip_spaces();
         self.read_eval()
     }
 
     fn read_scoped_vars(&mut self) -> ParseResult<LazyVars> {
         let mut vars = LazyVars::new();
-        while self.scanner.peek() == ' ' {
+        while self.scanner.peek() == b' ' {
             self.scanner.skip_spaces();
             let name = self.read_ident()?;
             self.scanner.skip_spaces();
@@ -146,21 +144,21 @@ impl<'text> Parser<'text> {
 
     fn read_rule(&mut self) -> ParseResult<Rule<'text>> {
         let name = self.read_ident()?;
-        self.scanner.expect('\n')?;
+        self.scanner.expect(b'\n')?;
         let vars = self.read_scoped_vars()?;
         Ok(Rule { name, vars })
     }
 
     fn read_pool(&mut self) -> ParseResult<Pool<'text>> {
         let name = self.read_ident()?;
-        self.scanner.expect('\n')?;
+        self.scanner.expect(b'\n')?;
         let vars = self.read_scoped_vars()?;
         let mut depth = 0;
         for (key, val) in vars.keyvals() {
-            match key.as_str() {
+            match key.as_str()? {
                 "depth" => {
                     let val = val.evaluate(&[]);
-                    depth = match val.parse::<usize>() {
+                    depth = match val.as_str()?.parse::<usize>() {
                         Ok(d) => d,
                         Err(err) => {
                             return self.scanner.parse_error(format!("pool depth: {}", err))
@@ -196,12 +194,12 @@ impl<'text> Parser<'text> {
         self.read_paths_to(loader, &mut outs)?;
         let explicit_outs = outs.len();
 
-        if self.scanner.peek() == '|' {
+        if self.scanner.peek() == b'|' {
             self.scanner.next();
             self.read_paths_to(loader, &mut outs)?;
         }
 
-        self.scanner.expect(':')?;
+        self.scanner.expect(b':')?;
         self.scanner.skip_spaces();
         let rule = self.read_ident()?;
 
@@ -209,9 +207,9 @@ impl<'text> Parser<'text> {
         self.read_paths_to(loader, &mut ins)?;
         let explicit_ins = ins.len();
 
-        if self.scanner.peek() == '|' {
+        if self.scanner.peek() == b'|' {
             self.scanner.next();
-            if self.scanner.peek() == '|' {
+            if self.scanner.peek() == b'|' {
                 self.scanner.back();
             } else {
                 self.read_paths_to(loader, &mut ins)?;
@@ -219,14 +217,14 @@ impl<'text> Parser<'text> {
         }
         let implicit_ins = ins.len() - explicit_ins;
 
-        if self.scanner.peek() == '|' {
+        if self.scanner.peek() == b'|' {
             self.scanner.next();
-            self.scanner.expect('|')?;
+            self.scanner.expect(b'|')?;
             self.read_paths_to(loader, &mut ins)?;
         }
         let order_only_ins = ins.len() - implicit_ins - explicit_ins;
 
-        self.scanner.expect('\n')?;
+        self.scanner.expect(b'\n')?;
         let vars = self.read_scoped_vars()?;
         Ok(Build {
             rule,
@@ -250,24 +248,24 @@ impl<'text> Parser<'text> {
         if defaults.is_empty() {
             return self.scanner.parse_error("expected path");
         }
-        self.scanner.expect('\n')?;
+        self.scanner.expect(b'\n')?;
         Ok(defaults)
     }
 
     fn skip_comment(&mut self) -> ParseResult<()> {
         loop {
             match self.scanner.read() {
-                '\0' => {
+                b'\0' => {
                     self.scanner.back();
                     return Ok(());
                 }
-                '\n' => return Ok(()),
+                b'\n' => return Ok(()),
                 _ => {}
             }
         }
     }
 
-    fn read_ident(&mut self) -> ParseResult<&'text str> {
+    fn read_ident(&mut self) -> ParseResult<&'text bstr> {
         let start = self.scanner.ofs;
         while is_ident_char(self.scanner.read() as u8) {}
         self.scanner.back();
@@ -278,15 +276,15 @@ impl<'text> Parser<'text> {
         Ok(self.scanner.slice(start, end))
     }
 
-    fn read_eval(&mut self) -> ParseResult<EvalString<&'text str>> {
+    fn read_eval(&mut self) -> ParseResult<EvalString<&'text bstr>> {
         // Guaranteed at least one part.
         let mut parts = Vec::with_capacity(1);
         let mut ofs = self.scanner.ofs;
         loop {
             match self.scanner.read() {
-                '\0' => return self.scanner.parse_error("unexpected EOF"),
-                '\n' => break,
-                '$' => {
+                b'\0' => return self.scanner.parse_error("unexpected EOF"),
+                b'\n' => break,
+                b'$' => {
                     let end = self.scanner.ofs - 1;
                     if end > ofs {
                         parts.push(EvalPart::Literal(self.scanner.slice(ofs, end)));
@@ -305,29 +303,29 @@ impl<'text> Parser<'text> {
     }
 
     fn read_path<L: Loader>(&mut self, loader: &mut L) -> ParseResult<Option<L::Path>> {
-        self.path_buf.clear();
+        let mut byte_buf = ByteString::with_capacity(64);
         loop {
             let c = self.scanner.read();
             if is_path_char(c as u8) {
-                self.path_buf.push(c);
+                byte_buf.push(c);
             } else {
                 match c {
-                    '\0' => {
+                    b'\0' => {
                         self.scanner.back();
                         return self.scanner.parse_error("unexpected EOF");
                     }
-                    '$' => {
+                    b'$' => {
                         let part = self.read_escape()?;
                         match part {
-                            EvalPart::Literal(l) => self.path_buf.push_str(l),
+                            EvalPart::Literal(l) => byte_buf.extend_from_slice(l),
                             EvalPart::VarRef(v) => {
                                 if let Some(v) = self.vars.get(v) {
-                                    self.path_buf.push_str(v);
+                                    byte_buf.extend_from_slice(v);
                                 }
                             }
                         }
                     }
-                    ':' | '|' | ' ' | '\n' => {
+                    b':' | b'|' | b' ' | b'\n' => {
                         self.scanner.back();
                         break;
                     }
@@ -340,27 +338,29 @@ impl<'text> Parser<'text> {
                 }
             }
         }
-        if self.path_buf.is_empty() {
-            return Ok(None);
+        if byte_buf.is_empty() {
+            Ok(None)
+        } else {
+            let path_buf = byte_buf.into_path_buf()?;
+            Ok(Some(loader.path(path_buf)))
         }
-        Ok(Some(loader.path(&mut self.path_buf)))
     }
 
-    fn read_escape(&mut self) -> ParseResult<EvalPart<&'text str>> {
+    fn read_escape(&mut self) -> ParseResult<EvalPart<&'text bstr>> {
         Ok(match self.scanner.read() {
-            '\n' => {
+            b'\n' => {
                 self.scanner.skip_spaces();
                 EvalPart::Literal(self.scanner.slice(0, 0))
             }
-            ' ' | '$' | ':' => {
+            b' ' | b'$' | b':' => {
                 EvalPart::Literal(self.scanner.slice(self.scanner.ofs - 1, self.scanner.ofs))
             }
-            '{' => {
+            b'{' => {
                 let start = self.scanner.ofs;
                 loop {
                     match self.scanner.read() {
-                        '\0' => return self.scanner.parse_error("unexpected EOF"),
-                        '}' => break,
+                        b'\0' => return self.scanner.parse_error("unexpected EOF"),
+                        b'}' => break,
                         _ => {}
                     }
                 }
@@ -378,9 +378,9 @@ impl<'text> Parser<'text> {
 
 struct StringLoader {}
 impl Loader for StringLoader {
-    type Path = String;
-    fn path(&mut self, path: &mut String) -> Self::Path {
-        path.to_string()
+    type Path = PathBuf;
+    fn path(&mut self, path_buf: PathBuf) -> Self::Path {
+        path_buf
     }
 }
 
@@ -401,7 +401,7 @@ default a b$var c
             Statement::Default(d) => d,
             s => panic!("expected default, got {:?}", s),
         };
-        assert_eq!(default, vec!["a", "b3", "c"]);
+        assert_eq!(default, &[Path::new("a"), Path::new("b3"), Path::new("c")]);
         println!("{:?}", default);
     }
 }

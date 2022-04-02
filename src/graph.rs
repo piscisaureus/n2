@@ -1,10 +1,14 @@
 //! The build graph, a graph between files and commands.
 
+use crate::byte_string::*;
 use crate::canon::{canon_path, canon_path_in_place};
 use crate::densemap::{self, DenseMap};
 use serde_derive::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::hash::{self, Hasher};
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::time::SystemTime;
 
 /// Hash value used to identify a given instance of a Build's execution;
@@ -44,7 +48,7 @@ impl From<usize> for BuildId {
 #[derive(Debug)]
 pub struct File {
     /// Canonical path to the file.
-    pub name: String,
+    pub name: Rc<PathBuf>,
     /// The Build that generates this file, if any.
     pub input: Option<BuildId>,
     /// The Builds that depend on this file as an input.
@@ -54,19 +58,19 @@ pub struct File {
 /// A textual location within a build.ninja file, used in error messages.
 #[derive(Debug)]
 pub struct FileLoc {
-    pub filename: std::rc::Rc<String>,
+    pub filename: Rc<PathBuf>,
     pub line: usize,
 }
 impl std::fmt::Display for FileLoc {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
-        write!(f, "{}:{}", self.filename, self.line)
+        write!(f, "{}:{}", self.filename.display(), self.line)
     }
 }
 
 #[derive(Debug, Clone, Hash)]
 pub struct RspFile {
-    pub path: std::path::PathBuf,
-    pub content: String,
+    pub path: PathBuf,
+    pub content: ByteString,
 }
 
 /// Input files to a Build.
@@ -95,19 +99,19 @@ pub struct Build {
     pub location: FileLoc,
 
     /// User-provided description of the build step.
-    pub desc: Option<String>,
+    pub desc: Option<ByteString>,
 
     /// Command line to run.  Absent for phony builds.
-    pub cmdline: Option<String>,
+    pub cmdline: Option<OsString>,
 
     /// Path to generated `.d` file, if any.
-    pub depfile: Option<String>,
+    pub depfile: Option<PathBuf>,
 
     // Struct that contains the path to the rsp file and its contents, if any.
     pub rspfile: Option<RspFile>,
 
     /// Pool to execute this build in, if any.
-    pub pool: Option<String>,
+    pub pool: Option<ByteString>,
 
     pub ins: BuildIns,
 
@@ -186,14 +190,6 @@ impl Build {
     pub fn outs(&self) -> &[FileId] {
         &self.outs.ids
     }
-
-    pub fn debug_name(&self, graph: &Graph) -> String {
-        format!(
-            "{} ({}, ...)",
-            self.location,
-            graph.file(self.outs()[0]).name
-        )
-    }
 }
 
 /// The build graph: owns Files/Builds and maps FileIds/BuildIds to them,
@@ -201,7 +197,7 @@ impl Build {
 pub struct Graph {
     files: DenseMap<FileId, File>,
     pub builds: DenseMap<BuildId, Build>,
-    file_to_id: HashMap<String, FileId>,
+    file_to_id: HashMap<Rc<PathBuf>, FileId>,
 }
 
 impl Graph {
@@ -215,9 +211,9 @@ impl Graph {
     }
 
     /// Add a new file, generating a new FileId for it.
-    fn add_file(&mut self, name: String) -> FileId {
+    fn add_file(&mut self, name: &Rc<PathBuf>) -> FileId {
         self.files.push(File {
-            name,
+            name: Rc::clone(name),
             input: None,
             dependents: Vec::new(),
         })
@@ -229,22 +225,23 @@ impl Graph {
     }
 
     /// Canonicalize a path and get/generate its FileId.
-    pub fn file_id(&mut self, canon: &mut String) -> FileId {
-        canon_path_in_place(canon);
-        match self.file_to_id.get(canon) {
+    pub fn file_id(&mut self, path: impl Into<PathBuf>) -> FileId {
+        let mut path_buf = path.into();
+        canon_path_in_place(&mut path_buf);
+        match self.file_to_id.get(&path_buf) {
             Some(id) => *id,
             None => {
-                // TODO: so many string copies :<
-                let id = self.add_file(canon.clone());
-                self.file_to_id.insert(canon.clone(), id);
+                let path_rc = Rc::new(path_buf);
+                let id = self.add_file(&path_rc);
+                self.file_to_id.insert(path_rc, id);
                 id
             }
         }
     }
 
     /// Canonicalize a path and look up its FileId.
-    pub fn lookup_file_id(&self, f: &str) -> Option<FileId> {
-        let canon = canon_path(f);
+    pub fn lookup_file_id(&self, path: impl Into<PathBuf>) -> Option<FileId> {
+        let canon = canon_path(path);
         self.file_to_id.get(&canon).copied()
     }
 
@@ -289,7 +286,7 @@ pub enum MTime {
 }
 
 /// stat() an on-disk path, producing its MTime.
-pub fn stat(path: &str) -> std::io::Result<MTime> {
+pub fn stat(path: &Path) -> std::io::Result<MTime> {
     // TODO: On Windows, use FindFirstFileEx()/FindNextFile() to get timestamps per
     //       directory, for better stat perf.
     Ok(match std::fs::metadata(path) {
@@ -317,7 +314,7 @@ impl FileState {
         *self.0.lookup(id).unwrap_or(&None)
     }
 
-    pub fn restat(&mut self, id: FileId, path: &str) -> std::io::Result<MTime> {
+    pub fn restat(&mut self, id: FileId, path: &Path) -> std::io::Result<MTime> {
         let mtime = stat(path)?;
         self.0.set_grow(id, Some(mtime), None);
         Ok(mtime)
@@ -342,7 +339,7 @@ fn hash_files(
             MTime::Stamp(mtime) => mtime,
             MTime::Missing => panic!("missing file: {:?}", name),
         };
-        hasher.write(graph.file(id).name.as_bytes());
+        std::hash::Hash::hash(&graph.file(id).name, hasher);
         std::hash::Hash::hash(&mtime, hasher);
         hasher.write_u8(UNIT_SEPARATOR);
     }
@@ -362,7 +359,7 @@ pub fn hash_build(
     hasher.write_u8(UNIT_SEPARATOR);
     hash_files(&mut hasher, graph, file_state, build.discovered_ins());
     hasher.write_u8(UNIT_SEPARATOR);
-    hasher.write(build.cmdline.as_ref().map(|c| c.as_bytes()).unwrap_or(b""));
+    hash::Hash::hash(&build.cmdline, &mut hasher);
     hasher.write_u8(UNIT_SEPARATOR);
     hash::Hash::hash(&build.rspfile, &mut hasher);
     hasher.write_u8(UNIT_SEPARATOR);
@@ -396,23 +393,22 @@ fn stat_mtime_resolution() {
 
     let temp_dir = tempfile::tempdir().unwrap();
     let filename = temp_dir.path().join("dummy");
-    let filename = filename.to_str().unwrap();
 
     // Write once and stat.
-    std::fs::write(filename, "foo").unwrap();
-    let mtime1 = match stat(filename).unwrap() {
+    std::fs::write(&filename, "foo").unwrap();
+    let mtime1 = match stat(&filename).unwrap() {
         MTime::Stamp(mtime) => mtime,
-        _ => panic!("File not found: {}", filename),
+        _ => panic!("File not found: {}", filename.display()),
     };
 
     // Sleep for a short interval.
     std::thread::sleep(std::time::Duration::from_millis(10));
 
     // Write twice and stat.
-    std::fs::write(filename, "foo").unwrap();
-    let mtime2 = match stat(filename).unwrap() {
+    std::fs::write(&filename, "foo").unwrap();
+    let mtime2 = match stat(&filename).unwrap() {
         MTime::Stamp(mtime) => mtime,
-        _ => panic!("File not found: {}", filename),
+        _ => panic!("File not found: {}", filename.display()),
     };
 
     let diff = mtime2.duration_since(mtime1).unwrap();
