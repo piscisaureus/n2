@@ -1,11 +1,22 @@
 //! Graph loading: runs .ninja parsing and constructs the build graph from it.
 
-use crate::graph::{FileId, RspFile};
-use crate::parse::Statement;
-use crate::{db, eval, graph, parse, trace};
-use anyhow::{anyhow, bail};
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::ffi::OsStr;
+use std::ffi::OsString;
+
+use anyhow::anyhow;
+use anyhow::bail;
+
+use crate::byte_string::*;
+use crate::db;
+use crate::eval;
+use crate::graph;
+use crate::graph::FileId;
+use crate::graph::RspFile;
+use crate::parse;
+use crate::parse::Statement;
+use crate::trace;
 
 /// A variable lookup environment for magic $in/$out variables.
 struct BuildImplicitVars<'a> {
@@ -13,26 +24,37 @@ struct BuildImplicitVars<'a> {
     build: &'a graph::Build,
 }
 impl<'a> BuildImplicitVars<'a> {
-    fn file_list(&self, ids: &[FileId], sep: char) -> String {
-        let mut out = String::new();
-        for &id in ids {
-            if !out.is_empty() {
-                out.push(sep);
+    fn file_name(&self, id: FileId) -> Cow<bstr> {
+        Cow::Borrowed(self.graph.file(id).name.as_bstr())
+    }
+
+    fn file_list(&self, ids: &[FileId], sep: u8) -> Cow<bstr> {
+        match ids.len() {
+            0 => Cow::Borrowed(&[]),
+            1 => self.file_name(ids[0]),
+            _ => {
+                let mut out = ByteString::new();
+                for &id in ids {
+                    if !out.is_empty() {
+                        out.push(sep);
+                    }
+                    out.extend_from_slice(&self.file_name(id));
+                }
+                Cow::Owned(out)
             }
-            out.push_str(&self.graph.file(id).name);
         }
-        out
     }
 }
+
 impl<'a> eval::Env for BuildImplicitVars<'a> {
-    fn get_var(&self, var: &str) -> Option<Cow<str>> {
-        match var {
-            "in" => Some(Cow::Owned(self.file_list(self.build.explicit_ins(), ' '))),
-            "in_newline" => Some(Cow::Owned(self.file_list(self.build.explicit_ins(), '\n'))),
-            "out" => Some(Cow::Owned(self.file_list(self.build.explicit_outs(), ' '))),
-            "out_newline" => Some(Cow::Owned(self.file_list(self.build.explicit_outs(), '\n'))),
-            _ => None,
-        }
+    fn get_var(&self, var: &bstr) -> Option<Cow<bstr>> {
+        Some(match var {
+            b"in" => self.file_list(self.build.explicit_ins(), b' '),
+            b"in_newline" => self.file_list(self.build.explicit_ins(), b'\n'),
+            b"out" => self.file_list(self.build.explicit_outs(), b' '),
+            b"out_newline" => self.file_list(self.build.explicit_outs(), b'\n'),
+            _ => return None,
+        })
     }
 }
 
@@ -40,14 +62,14 @@ impl<'a> eval::Env for BuildImplicitVars<'a> {
 struct Loader {
     graph: graph::Graph,
     default: Vec<FileId>,
-    rules: HashMap<String, eval::LazyVars>,
-    pools: Vec<(String, usize)>,
+    rules: HashMap<ByteString, eval::LazyVars>,
+    pools: Vec<(ByteString, usize)>,
 }
 
 impl parse::Loader for Loader {
     type Path = FileId;
-    fn path(&mut self, path: &mut String) -> Self::Path {
-        self.graph.file_id(path)
+    fn path(&mut self, path_buf: OsString) -> Self::Path {
+        self.graph.file_id(path_buf)
     }
 }
 
@@ -62,14 +84,14 @@ impl Loader {
 
         loader
             .rules
-            .insert("phony".to_owned(), eval::LazyVars::new());
+            .insert("phony".to_byte_string(), eval::LazyVars::new());
 
         loader
     }
 
     fn add_build<'a>(
         &mut self,
-        filename: std::rc::Rc<String>,
+        file_id: FileId,
         env: &eval::Vars<'a>,
         b: parse::Build<FileId>,
     ) -> anyhow::Result<()> {
@@ -85,7 +107,7 @@ impl Loader {
         };
         let mut build = graph::Build::new(
             graph::FileLoc {
-                filename,
+                path: file_id,
                 line: b.line,
             },
             ins,
@@ -104,24 +126,29 @@ impl Loader {
         let build_vars = &b.vars;
         let envs: [&dyn eval::Env; 4] = [&implicit_vars, build_vars, rule, env];
 
-        let lookup = |key: &str| {
+        let lookup = |key: &bstr| {
             build_vars
                 .get(key)
                 .or_else(|| rule.get(key))
                 .map(|var| var.evaluate(&envs))
         };
 
-        let cmdline = lookup("command");
-        let desc = lookup("description");
-        let depfile = lookup("depfile");
-        let pool = lookup("pool");
+        let desc = lookup(b"description");
+        let pool = lookup(b"pool");
 
-        let rspfile_path = lookup("rspfile");
-        let rspfile_content = lookup("rspfile_content");
+        let cmdline = lookup(b"command")
+            .map(ByteString::into_os_string)
+            .transpose()?;
+        let depfile = lookup(b"depfile")
+            .map(ByteString::into_os_string)
+            .transpose()?;
+
+        let rspfile_path = lookup(b"rspfile");
+        let rspfile_content = lookup(b"rspfile_content");
         let rspfile = match (rspfile_path, rspfile_content) {
             (None, None) => None,
             (Some(path), Some(content)) => Some(RspFile {
-                path: std::path::PathBuf::from(path),
+                path: path.into_os_string()?,
                 content,
             }),
             _ => bail!("rspfile and rspfile_content need to be both specified"),
@@ -137,23 +164,25 @@ impl Loader {
         Ok(())
     }
 
-    fn read_file(&mut self, id: FileId) -> anyhow::Result<()> {
-        let path = self.graph.file(id).name.clone();
-        let bytes = match trace::scope("fs::read", || std::fs::read(&path)) {
-            Ok(b) => b,
-            Err(e) => bail!("read {}: {}", path, e),
-        };
-        self.parse(path, bytes)
+    fn file_name(&self, id: FileId) -> &OsStr {
+        &self.graph.file(id).name
     }
 
-    fn parse(&mut self, path: String, mut bytes: Vec<u8>) -> anyhow::Result<()> {
-        let filename = std::rc::Rc::new(path);
+    fn read_file(&mut self, id: FileId) -> anyhow::Result<()> {
+        let path = self.file_name(id);
+        let bytes = match trace::scope("fs::read", || std::fs::read(path)) {
+            Ok(b) => b,
+            Err(e) => bail!("read {:?}: {}", path, e),
+        };
+        self.parse(id, bytes)
+    }
 
+    fn parse(&mut self, id: FileId, mut bytes: ByteString) -> anyhow::Result<()> {
         let mut parser = parse::Parser::new(&mut bytes);
         loop {
             let stmt = match parser
                 .read(self)
-                .map_err(|err| anyhow!(parser.format_parse_error(&*filename, err)))?
+                .map_err(|err| anyhow!(parser.format_parse_error(self.file_name(id), err)))?
             {
                 None => break,
                 Some(s) => s,
@@ -168,9 +197,9 @@ impl Loader {
                 Statement::Rule(rule) => {
                     self.rules.insert(rule.name.to_owned(), rule.vars);
                 }
-                Statement::Build(build) => self.add_build(filename.clone(), &parser.vars, build)?,
+                Statement::Build(build) => self.add_build(id, &parser.vars, build)?,
                 Statement::Pool(pool) => {
-                    self.pools.push((pool.name.to_string(), pool.depth));
+                    self.pools.push((pool.name.to_owned(), pool.depth));
                 }
             };
         }
@@ -184,14 +213,14 @@ pub struct State {
     pub db: db::Writer,
     pub hashes: graph::Hashes,
     pub default: Vec<FileId>,
-    pub pools: Vec<(String, usize)>,
+    pub pools: Vec<(ByteString, usize)>,
 }
 
 /// Load build.ninja/.n2_db and return the loaded build graph and state.
 pub fn read() -> anyhow::Result<State> {
     let mut loader = Loader::new();
     trace::scope("loader.read_file", || {
-        let id = loader.graph.file_id(&mut "build.ninja".to_string());
+        let id = loader.graph.file_id("build.ninja");
         loader.read_file(id)
     })?;
     let mut hashes = graph::Hashes::new();
@@ -210,8 +239,9 @@ pub fn read() -> anyhow::Result<State> {
 
 /// Parse a single file's content.
 #[cfg(test)]
-pub fn parse(name: String, content: Vec<u8>) -> anyhow::Result<graph::Graph> {
+pub fn parse(path: impl AsRef<OsStr>, content: ByteString) -> anyhow::Result<graph::Graph> {
     let mut loader = Loader::new();
-    trace::scope("loader.read_file", || loader.parse(name, content))?;
+    let id = loader.graph.file_id(path.as_ref());
+    trace::scope("loader.parse", || loader.parse(id, content))?;
     Ok(loader.graph)
 }

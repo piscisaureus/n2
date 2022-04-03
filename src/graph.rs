@@ -1,14 +1,25 @@
 //! The build graph, a graph between files and commands.
 
-use crate::canon::{canon_path, canon_path_in_place};
-use crate::densemap::{self, DenseMap};
 use std::collections::HashMap;
-use std::hash::{self, Hasher};
+use std::ffi::OsStr;
+use std::ffi::OsString;
+use std::hash::Hasher;
+use std::hash::{self};
+use std::rc::Rc;
 use std::time::SystemTime;
+
+use serde_derive::Deserialize;
+use serde_derive::Serialize;
+
+use crate::byte_string::*;
+use crate::canon::canon_path;
+use crate::canon::canon_path_in_place;
+use crate::densemap::DenseMap;
+use crate::densemap::{self};
 
 /// Hash value used to identify a given instance of a Build's execution;
 /// compared to verify whether a Build is up to date.
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Hash(pub u64);
 
 /// Id for File nodes in the Graph.
@@ -43,7 +54,7 @@ impl From<usize> for BuildId {
 #[derive(Debug)]
 pub struct File {
     /// Canonical path to the file.
-    pub name: String,
+    pub name: Rc<OsStr>,
     /// The Build that generates this file, if any.
     pub input: Option<BuildId>,
     /// The Builds that depend on this file as an input.
@@ -52,20 +63,30 @@ pub struct File {
 
 /// A textual location within a build.ninja file, used in error messages.
 #[derive(Debug)]
-pub struct FileLoc {
-    pub filename: std::rc::Rc<String>,
+pub struct FileLoc<P = FileId> {
+    pub path: P,
     pub line: usize,
 }
-impl std::fmt::Display for FileLoc {
+
+impl FileLoc<FileId> {
+    pub fn fill<'a>(&self, graph: &'a Graph) -> FileLoc<&'a OsStr> {
+        FileLoc {
+            path: graph.files.get(self.path).name.as_ref(),
+            line: self.line,
+        }
+    }
+}
+
+impl std::fmt::Display for FileLoc<&OsStr> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
-        write!(f, "{}:{}", self.filename, self.line)
+        write!(f, "{}:{}", self.path.as_str_lossy(), self.line)
     }
 }
 
 #[derive(Debug, Clone, Hash)]
 pub struct RspFile {
-    pub path: std::path::PathBuf,
-    pub content: String,
+    pub path: OsString,
+    pub content: ByteString,
 }
 
 /// Input files to a Build.
@@ -94,19 +115,19 @@ pub struct Build {
     pub location: FileLoc,
 
     /// User-provided description of the build step.
-    pub desc: Option<String>,
+    pub desc: Option<ByteString>,
 
     /// Command line to run.  Absent for phony builds.
-    pub cmdline: Option<String>,
+    pub cmdline: Option<OsString>,
 
     /// Path to generated `.d` file, if any.
-    pub depfile: Option<String>,
+    pub depfile: Option<OsString>,
 
     // Struct that contains the path to the rsp file and its contents, if any.
     pub rspfile: Option<RspFile>,
 
     /// Pool to execute this build in, if any.
-    pub pool: Option<String>,
+    pub pool: Option<ByteString>,
 
     pub ins: BuildIns,
 
@@ -185,14 +206,6 @@ impl Build {
     pub fn outs(&self) -> &[FileId] {
         &self.outs.ids
     }
-
-    pub fn debug_name(&self, graph: &Graph) -> String {
-        format!(
-            "{} ({}, ...)",
-            self.location,
-            graph.file(self.outs()[0]).name
-        )
-    }
 }
 
 /// The build graph: owns Files/Builds and maps FileIds/BuildIds to them,
@@ -200,7 +213,12 @@ impl Build {
 pub struct Graph {
     files: DenseMap<FileId, File>,
     pub builds: DenseMap<BuildId, Build>,
-    file_to_id: HashMap<String, FileId>,
+    // Although the `file_to_id`'s keys are filesystem paths, we're using
+    // `OsStr` to store then and not `Path`. The reason for this is that `Path`
+    // has a very slow `Hash` impl, which normalizes the path every time the
+    // hash is computed. It's no more than a slight inconvenience, as `OsStr`
+    // implements `AsRef<Path>` and vice versa.
+    file_to_id: HashMap<Rc<OsStr>, FileId>,
 }
 
 impl Graph {
@@ -214,7 +232,7 @@ impl Graph {
     }
 
     /// Add a new file, generating a new FileId for it.
-    fn add_file(&mut self, name: String) -> FileId {
+    fn add_file(&mut self, name: Rc<OsStr>) -> FileId {
         self.files.push(File {
             name,
             input: None,
@@ -228,23 +246,25 @@ impl Graph {
     }
 
     /// Canonicalize a path and get/generate its FileId.
-    pub fn file_id(&mut self, canon: &mut String) -> FileId {
-        canon_path_in_place(canon);
-        match self.file_to_id.get(canon) {
+    pub fn file_id(&mut self, path_buf: impl Into<OsString>) -> FileId {
+        let mut path_buf = path_buf.into();
+        canon_path_in_place(&mut path_buf);
+        match self.file_to_id.get(&*path_buf) {
             Some(id) => *id,
             None => {
-                // TODO: so many string copies :<
-                let id = self.add_file(canon.clone());
-                self.file_to_id.insert(canon.clone(), id);
+                let path_rc1 = Rc::from(path_buf.as_os_str());
+                let path_rc2 = Rc::clone(&path_rc1);
+                let id = self.add_file(path_rc1);
+                self.file_to_id.insert(path_rc2, id);
                 id
             }
         }
     }
 
     /// Canonicalize a path and look up its FileId.
-    pub fn lookup_file_id(&self, f: &str) -> Option<FileId> {
-        let canon = canon_path(f);
-        self.file_to_id.get(&canon).copied()
+    pub fn lookup_file_id(&self, path: impl Into<OsString>) -> Option<FileId> {
+        let canon = canon_path(path);
+        self.file_to_id.get(canon.as_os_str()).copied()
     }
 
     /// Add a new Build, generating a BuildId for it.
@@ -288,10 +308,10 @@ pub enum MTime {
 }
 
 /// stat() an on-disk path, producing its MTime.
-pub fn stat(path: &str) -> std::io::Result<MTime> {
+pub fn stat(path: impl AsRef<OsStr>) -> std::io::Result<MTime> {
     // TODO: On Windows, use FindFirstFileEx()/FindNextFile() to get timestamps per
     //       directory, for better stat perf.
-    Ok(match std::fs::metadata(path) {
+    Ok(match std::fs::metadata(path.as_ref()) {
         Ok(meta) => MTime::Stamp(meta.modified().unwrap()),
         Err(err) => {
             if err.kind() == std::io::ErrorKind::NotFound {
@@ -316,7 +336,7 @@ impl FileState {
         *self.0.lookup(id).unwrap_or(&None)
     }
 
-    pub fn restat(&mut self, id: FileId, path: &str) -> std::io::Result<MTime> {
+    pub fn restat(&mut self, id: FileId, path: impl AsRef<OsStr>) -> std::io::Result<MTime> {
         let mtime = stat(path)?;
         self.0.set_grow(id, Some(mtime), None);
         Ok(mtime)
@@ -341,7 +361,7 @@ fn hash_files(
             MTime::Stamp(mtime) => mtime,
             MTime::Missing => panic!("missing file: {:?}", name),
         };
-        hasher.write(graph.file(id).name.as_bytes());
+        std::hash::Hash::hash(name, hasher);
         std::hash::Hash::hash(&mtime, hasher);
         hasher.write_u8(UNIT_SEPARATOR);
     }
@@ -361,7 +381,7 @@ pub fn hash_build(
     hasher.write_u8(UNIT_SEPARATOR);
     hash_files(&mut hasher, graph, file_state, build.discovered_ins());
     hasher.write_u8(UNIT_SEPARATOR);
-    hasher.write(build.cmdline.as_ref().map(|c| c.as_bytes()).unwrap_or(b""));
+    hash::Hash::hash(&build.cmdline, &mut hasher);
     hasher.write_u8(UNIT_SEPARATOR);
     hash::Hash::hash(&build.rspfile, &mut hasher);
     hasher.write_u8(UNIT_SEPARATOR);
@@ -395,23 +415,22 @@ fn stat_mtime_resolution() {
 
     let temp_dir = tempfile::tempdir().unwrap();
     let filename = temp_dir.path().join("dummy");
-    let filename = filename.to_str().unwrap();
 
     // Write once and stat.
-    std::fs::write(filename, "foo").unwrap();
-    let mtime1 = match stat(filename).unwrap() {
+    std::fs::write(&filename, "foo").unwrap();
+    let mtime1 = match stat(&filename).unwrap() {
         MTime::Stamp(mtime) => mtime,
-        _ => panic!("File not found: {}", filename),
+        _ => panic!("File not found: {}", filename.as_str_lossy()),
     };
 
     // Sleep for a short interval.
     std::thread::sleep(std::time::Duration::from_millis(10));
 
     // Write twice and stat.
-    std::fs::write(filename, "foo").unwrap();
-    let mtime2 = match stat(filename).unwrap() {
+    std::fs::write(&filename, "foo").unwrap();
+    let mtime2 = match stat(&filename).unwrap() {
         MTime::Stamp(mtime) => mtime,
-        _ => panic!("File not found: {}", filename),
+        _ => panic!("File not found: {}", filename.as_str_lossy()),
     };
 
     let diff = mtime2.duration_since(mtime1).unwrap();

@@ -1,11 +1,13 @@
 extern crate getopts;
 
+use std::ffi::OsStr;
+use std::path::Path;
+
 use anyhow::anyhow;
 use n2::load;
 use n2::progress::ConsoleProgress;
 use n2::trace;
 use n2::work;
-use std::path::Path;
 
 // The result of starting a build.
 enum BuildResult {
@@ -22,11 +24,11 @@ enum BuildResult {
 // possible, and if that build changes build.ninja, then return
 // BuildResult::Regen to signal to the caller that we need to start the whole
 // build over.
-fn build(
+fn build<S: AsRef<OsStr>>(
     progress: &mut ConsoleProgress,
     parallelism: usize,
     regen: bool,
-    target_names: &[String],
+    target_names: &[S],
 ) -> anyhow::Result<BuildResult> {
     let mut state = trace::scope("load::read", load::read)?;
 
@@ -58,7 +60,7 @@ fn build(
 
     if !target_names.is_empty() {
         for name in target_names {
-            work.want_file(name)?;
+            work.want_file(name.as_ref())?;
         }
     } else if !state.default.is_empty() {
         for target in state.default {
@@ -192,7 +194,7 @@ fn run() -> anyhow::Result<i32> {
         }
     }
 
-    return Ok(0);
+    Ok(0)
 }
 
 fn main() {

@@ -1,5 +1,11 @@
 //! Integration test.  Runs n2 binary against a temp directory.
 
+use std::ffi::OsStr;
+use std::io::Write;
+use std::path::Path;
+
+const NO_ARGS: &[&str] = &[];
+
 fn n2_binary() -> std::path::PathBuf {
     std::env::current_exe()
         .expect("test binary path")
@@ -8,10 +14,11 @@ fn n2_binary() -> std::path::PathBuf {
         .parent()
         .expect("binary directory")
         .join("n2")
-        .to_path_buf()
 }
 
-fn n2_command(args: Vec<&str>) -> std::process::Command {
+fn n2_command<S: AsRef<OsStr>>(args: &[S]) -> std::process::Command
+where
+{
     let mut cmd = std::process::Command::new(n2_binary());
     cmd.args(args);
     cmd
@@ -20,7 +27,7 @@ fn n2_command(args: Vec<&str>) -> std::process::Command {
 fn print_output(out: &std::process::Output) {
     // Gross: use print! instead of writing to stdout so Rust test
     // framework can capture it.
-    print!("{}", std::str::from_utf8(&out.stdout).unwrap());
+    std::io::stdout().write_all(&out.stdout).unwrap();
 }
 
 fn assert_output_contains(out: &std::process::Output, text: &str) {
@@ -44,17 +51,17 @@ impl TestSpace {
     }
 
     /// Write a file into the working space.
-    fn write(&self, path: &str, content: &str) -> std::io::Result<()> {
-        std::fs::write(self.dir.path().join(path), content)
+    fn write(&self, path: impl AsRef<Path>, content: &str) -> std::io::Result<()> {
+        std::fs::write(self.dir.path().join(path.as_ref()), content)
     }
 
     /// Read a file from the working space.
-    fn read(&self, path: &str) -> std::io::Result<Vec<u8>> {
-        std::fs::read(self.dir.path().join(path))
+    fn read(&self, path: impl AsRef<Path>) -> std::io::Result<Vec<u8>> {
+        std::fs::read(self.dir.path().join(path.as_ref()))
     }
 
-    fn metadata(&self, path: &str) -> std::io::Result<std::fs::Metadata> {
-        std::fs::metadata(self.dir.path().join(path))
+    fn metadata(&self, path: impl AsRef<Path>) -> std::io::Result<std::fs::Metadata> {
+        std::fs::metadata(self.dir.path().join(path.as_ref()))
     }
 
     /// Invoke n2, returning process output.
@@ -82,7 +89,7 @@ impl TestSpace {
 fn empty_file() -> anyhow::Result<()> {
     let space = TestSpace::new()?;
     space.write("build.ninja", "")?;
-    let out = space.run(&mut n2_command(vec![]))?;
+    let out = space.run(&mut n2_command(NO_ARGS))?;
     assert_eq!(
         std::str::from_utf8(&out.stdout)?,
         "n2: error: no path specified and no default\n"
@@ -110,7 +117,7 @@ fn basic_build() -> anyhow::Result<()> {
         &[TOUCH_RULE, "build out: touch in", ""].join("\n"),
     )?;
     space.write("in", "")?;
-    space.run_expect(&mut n2_command(vec!["out"]))?;
+    space.run_expect(&mut n2_command(&["out"]))?;
     assert!(space.read("out").is_ok());
 
     Ok(())
@@ -124,7 +131,7 @@ fn create_subdir() -> anyhow::Result<()> {
         &[TOUCH_RULE, "build subdir/out: touch in", ""].join("\n"),
     )?;
     space.write("in", "")?;
-    space.run_expect(&mut n2_command(vec!["subdir/out"]))?;
+    space.run_expect(&mut n2_command(&["subdir/out"]))?;
     assert!(space.read("subdir/out").is_ok());
 
     Ok(())
@@ -151,14 +158,14 @@ EOT
     )?;
 
     // Generate the initial build.ninja.
-    space.run_expect(std::process::Command::new("sh").args(vec!["./gen.sh"]))?;
+    space.run_expect(std::process::Command::new("sh").args(&["./gen.sh"]))?;
 
     // Run: expect to regenerate because we don't know how the file was made.
-    let out = space.run_expect(&mut n2_command(vec!["out"]))?;
+    let out = space.run_expect(&mut n2_command(&["out"]))?;
     assert_output_contains(&out, "ran 1 task");
 
     // Run: everything should be up to date.
-    let out = space.run_expect(&mut n2_command(vec!["out"]))?;
+    let out = space.run_expect(&mut n2_command(&["out"]))?;
     assert_output_contains(&out, "no work");
 
     Ok(())
@@ -192,7 +199,7 @@ build baz: touch in
     )?;
     space.write("in", "go!")?;
 
-    let _ = space.run_expect(&mut n2_command(vec!["main"]))?;
+    let _ = space.run_expect(&mut n2_command(&["main"]))?;
 
     // The 'main' and 'foo' targets copy the contents of their rsp file to their
     // output.
@@ -207,7 +214,7 @@ build baz: touch in
     assert!(meta.is_dir());
 
     // Run again: everything should be up to date.
-    let out = space.run_expect(&mut n2_command(vec!["main"]))?;
+    let out = space.run_expect(&mut n2_command(&["main"]))?;
     assert_output_contains(&out, "no work");
 
     Ok(())
@@ -232,7 +239,7 @@ build b: spam a
 build c: quiet b
 ",
     )?;
-    let out = space.run_expect(&mut n2_command(vec!["c"]))?;
+    let out = space.run_expect(&mut n2_command(&["c"]))?;
     assert_output_contains(
         &out,
         "quiet a
