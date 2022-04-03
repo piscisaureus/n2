@@ -5,6 +5,7 @@ use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::hash::Hasher;
 use std::hash::{self};
+use std::rc::Rc;
 use std::time::SystemTime;
 
 use serde_derive::Deserialize;
@@ -53,7 +54,7 @@ impl From<usize> for BuildId {
 #[derive(Debug)]
 pub struct File {
     /// Canonical path to the file.
-    pub name: OsString,
+    pub name: Rc<OsStr>,
     /// The Build that generates this file, if any.
     pub input: Option<BuildId>,
     /// The Builds that depend on this file as an input.
@@ -212,10 +213,12 @@ impl Build {
 pub struct Graph {
     files: DenseMap<FileId, File>,
     pub builds: DenseMap<BuildId, Build>,
-    // Using `OsString` as the key type here although the key is actually a
-    // `PathBuf`. This is done because `PathBuf` has a very slow `Hash` impl,
-    // which normalizes the path every time the hash is computed.
-    file_to_id: HashMap<OsString, FileId>,
+    // Although the `file_to_id`'s keys are filesystem paths, we're using
+    // `OsStr` to store then and not `Path`. The reason for this is that `Path`
+    // has a very slow `Hash` impl, which normalizes the path every time the
+    // hash is computed. It's no more than a slight inconvenience, as `OsStr`
+    // implements `AsRef<Path>` and vice versa.
+    file_to_id: HashMap<Rc<OsStr>, FileId>,
 }
 
 impl Graph {
@@ -229,7 +232,7 @@ impl Graph {
     }
 
     /// Add a new file, generating a new FileId for it.
-    fn add_file(&mut self, name: OsString) -> FileId {
+    fn add_file(&mut self, name: Rc<OsStr>) -> FileId {
         self.files.push(File {
             name,
             input: None,
@@ -246,11 +249,13 @@ impl Graph {
     pub fn file_id(&mut self, path_buf: impl Into<OsString>) -> FileId {
         let mut path_buf = path_buf.into();
         canon_path_in_place(&mut path_buf);
-        match self.file_to_id.get(&path_buf) {
+        match self.file_to_id.get(&*path_buf) {
             Some(id) => *id,
             None => {
-                let id = self.add_file(path_buf.to_owned());
-                self.file_to_id.insert(path_buf, id);
+                let path_rc1 = Rc::from(path_buf.as_os_str());
+                let path_rc2 = Rc::clone(&path_rc1);
+                let id = self.add_file(path_rc1);
+                self.file_to_id.insert(path_rc2, id);
                 id
             }
         }
@@ -259,7 +264,7 @@ impl Graph {
     /// Canonicalize a path and look up its FileId.
     pub fn lookup_file_id(&self, path: impl Into<OsString>) -> Option<FileId> {
         let canon = canon_path(path);
-        self.file_to_id.get(&canon).copied()
+        self.file_to_id.get(canon.as_os_str()).copied()
     }
 
     /// Add a new Build, generating a BuildId for it.
