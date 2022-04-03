@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::ffi::OsStr;
+
 use std::ffi::OsString;
 
 use anyhow::anyhow;
@@ -20,25 +20,21 @@ use crate::trace;
 
 /// A variable lookup environment for magic $in/$out variables.
 struct BuildImplicitVars<'a> {
-    graph: &'a graph::Graph,
     build: &'a graph::Build,
 }
-impl<'a> BuildImplicitVars<'a> {
-    fn file_name(&self, id: FileId) -> Cow<bstr> {
-        Cow::Borrowed(self.graph.file(id).name.as_bstr())
-    }
 
+impl<'a> BuildImplicitVars<'a> {
     fn file_list(&self, ids: &[FileId], sep: u8) -> Cow<bstr> {
         match ids.len() {
             0 => Cow::Borrowed(&[]),
-            1 => self.file_name(ids[0]),
+            1 => Cow::Owned(ids[0].name.to_byte_string()),
             _ => {
                 let mut out = ByteString::new();
-                for &id in ids {
+                for id in ids {
                     if !out.is_empty() {
                         out.push(sep);
                     }
-                    out.extend_from_slice(&self.file_name(id));
+                    out.extend_from_slice(id.name.as_bstr());
                 }
                 Cow::Owned(out)
             }
@@ -119,10 +115,7 @@ impl Loader {
             None => bail!("unknown rule {:?}", b.rule),
         };
 
-        let implicit_vars = BuildImplicitVars {
-            graph: &self.graph,
-            build: &build,
-        };
+        let implicit_vars = BuildImplicitVars { build: &build };
         let build_vars = &b.vars;
         let envs: [&dyn eval::Env; 4] = [&implicit_vars, build_vars, rule, env];
 
@@ -164,12 +157,8 @@ impl Loader {
         Ok(())
     }
 
-    fn file_name(&self, id: FileId) -> &OsStr {
-        &self.graph.file(id).name
-    }
-
-    fn read_file(&mut self, id: FileId) -> anyhow::Result<()> {
-        let path = self.file_name(id);
+    fn read_file(&mut self, id: &FileId) -> anyhow::Result<()> {
+        let path = &*id.name;
         let bytes = match trace::scope("fs::read", || std::fs::read(path)) {
             Ok(b) => b,
             Err(e) => bail!("read {:?}: {}", path, e),
@@ -177,27 +166,27 @@ impl Loader {
         self.parse(id, bytes)
     }
 
-    fn parse(&mut self, id: FileId, mut bytes: ByteString) -> anyhow::Result<()> {
+    fn parse(&mut self, id: &FileId, mut bytes: ByteString) -> anyhow::Result<()> {
         let mut parser = parse::Parser::new(&mut bytes);
         loop {
             let stmt = match parser
                 .read(self)
-                .map_err(|err| anyhow!(parser.format_parse_error(self.file_name(id), err)))?
+                .map_err(|err| anyhow!(parser.format_parse_error(&*id.name, err)))?
             {
                 None => break,
                 Some(s) => s,
             };
             match stmt {
-                Statement::Include(id) => trace::scope("include", || self.read_file(id))?,
+                Statement::Include(id) => trace::scope("include", || self.read_file(&id))?,
                 // TODO: implement scoping for subninja
-                Statement::Subninja(id) => trace::scope("subninja", || self.read_file(id))?,
+                Statement::Subninja(id) => trace::scope("subninja", || self.read_file(&id))?,
                 Statement::Default(defaults) => {
                     self.default.extend(defaults);
                 }
                 Statement::Rule(rule) => {
                     self.rules.insert(rule.name.to_owned(), rule.vars);
                 }
-                Statement::Build(build) => self.add_build(id, &parser.vars, build)?,
+                Statement::Build(build) => self.add_build(id.clone(), &parser.vars, build)?,
                 Statement::Pool(pool) => {
                     self.pools.push((pool.name.to_owned(), pool.depth));
                 }
@@ -221,7 +210,7 @@ pub fn read() -> anyhow::Result<State> {
     let mut loader = Loader::new();
     trace::scope("loader.read_file", || {
         let id = loader.graph.file_id("build.ninja");
-        loader.read_file(id)
+        loader.read_file(&id)
     })?;
     let mut hashes = graph::Hashes::new();
     let db = trace::scope("db::open", || {
@@ -239,9 +228,12 @@ pub fn read() -> anyhow::Result<State> {
 
 /// Parse a single file's content.
 #[cfg(test)]
-pub fn parse(path: impl AsRef<OsStr>, content: ByteString) -> anyhow::Result<graph::Graph> {
+pub fn parse(
+    path: impl AsRef<std::ffi::OsStr>,
+    content: ByteString,
+) -> anyhow::Result<graph::Graph> {
     let mut loader = Loader::new();
     let id = loader.graph.file_id(path.as_ref());
-    trace::scope("loader.parse", || loader.parse(id, content))?;
+    trace::scope("loader.parse", || loader.parse(&id, content))?;
     Ok(loader.graph)
 }

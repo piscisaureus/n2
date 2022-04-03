@@ -65,14 +65,14 @@ impl Writer {
         Writer { ids, w }
     }
 
-    fn ensure_id(&mut self, graph: &Graph, file_id: FileId) -> anyhow::Result<Id> {
-        let id = match self.ids.db_ids.get(&file_id) {
+    fn ensure_id(&mut self, file_id: &FileId) -> anyhow::Result<Id> {
+        let id = match self.ids.db_ids.get(file_id) {
             Some(&id) => id,
             None => {
-                let id = self.ids.file_ids.push(file_id);
-                self.ids.db_ids.insert(file_id, id);
+                let id = self.ids.file_ids.push(file_id.clone());
+                self.ids.db_ids.insert(file_id.clone(), id);
 
-                let entry = DbEntry::File((&*graph.file(file_id).name).to_byte_string());
+                let entry = DbEntry::File((&*(file_id).name).to_byte_string());
                 serde_cbor::ser::to_writer(&mut self.w, &entry)?;
 
                 id
@@ -86,12 +86,12 @@ impl Writer {
         let outs = build
             .outs()
             .iter()
-            .map(|&file_id| self.ensure_id(graph, file_id))
+            .map(|file_id| self.ensure_id(file_id))
             .collect::<anyhow::Result<Vec<_>>>()?;
         let deps = build
             .discovered_ins()
             .iter()
-            .map(|&file_id| self.ensure_id(graph, file_id))
+            .map(|file_id| self.ensure_id(file_id))
             .collect::<anyhow::Result<Vec<_>>>()?;
         let entry = DbEntry::Build { outs, deps, hash };
         serde_cbor::ser::to_writer(&mut self.w, &entry)?;
@@ -121,7 +121,7 @@ pub fn open(path: &str, graph: &mut Graph, hashes: &mut Hashes) -> anyhow::Resul
         match entry {
             DbEntry::File(name) => {
                 let file_id = graph.file_id(name.into_os_string()?);
-                let db_id = ids.file_ids.push(file_id);
+                let db_id = ids.file_ids.push(file_id.clone());
                 ids.db_ids.insert(file_id, db_id);
             }
             DbEntry::Build { outs, deps, hash } => {
@@ -129,11 +129,18 @@ pub fn open(path: &str, graph: &mut Graph, hashes: &mut Hashes) -> anyhow::Resul
                 // In the common case, there is only one.
                 let builds = outs
                     .into_iter()
-                    .filter_map(|id| graph.file(*ids.file_ids.get(id)).input)
+                    .filter_map(|id| {
+                        graph
+                            .file(ids.file_ids.get(id))
+                            .input
+                            .borrow()
+                            .as_ref()
+                            .copied()
+                    })
                     .collect::<HashSet<_>>();
                 let deps = deps
                     .into_iter()
-                    .map(|id| *ids.file_ids.get(id))
+                    .map(|id| ids.file_ids.get(id).clone())
                     .collect::<Vec<_>>();
                 if builds.len() == 1 {
                     // Common case: only one associated build.

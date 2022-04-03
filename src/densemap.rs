@@ -2,7 +2,7 @@
 
 use std::marker::PhantomData;
 
-pub trait Index: From<usize> {
+pub trait Index /*: From<usize> */ {
     fn index(&self) -> usize;
 }
 
@@ -29,15 +29,21 @@ impl<K: Index, V> DenseMap<K, V> {
         &mut self.vec[k.index()]
     }
 
-    pub fn lookup(&self, k: K) -> Option<&V> {
+    pub fn lookup(&self, k: &K) -> Option<&V> {
         self.vec.get(k.index())
     }
 
-    pub fn next_id(&self) -> K {
+    pub fn next_id(&self) -> K
+    where
+        K: From<usize>,
+    {
         K::from(self.vec.len())
     }
 
-    pub fn push(&mut self, val: V) -> K {
+    pub fn push(&mut self, val: V) -> K
+    where
+        K: From<usize>,
+    {
         let id = self.next_id();
         self.vec.push(val);
         id
@@ -45,9 +51,9 @@ impl<K: Index, V> DenseMap<K, V> {
 }
 
 impl<K: Index, V: Clone> DenseMap<K, V> {
-    pub fn new_sized(n: K, default: V) -> Self {
+    pub fn new_sized(n: usize, default: V) -> Self {
         let mut m = Self::new();
-        m.vec.resize(n.index(), default);
+        m.vec.resize(n, default);
         m
     }
 

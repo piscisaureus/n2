@@ -1,10 +1,13 @@
 //! The build graph, a graph between files and commands.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::hash::Hasher;
 use std::hash::{self};
+
 use std::rc::Rc;
 use std::time::SystemTime;
 
@@ -15,26 +18,13 @@ use crate::byte_string::*;
 use crate::canon::canon_path;
 use crate::canon::canon_path_in_place;
 use crate::densemap::DenseMap;
+use crate::densemap::Index;
 use crate::densemap::{self};
 
 /// Hash value used to identify a given instance of a Build's execution;
 /// compared to verify whether a Build is up to date.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Hash(pub u64);
-
-/// Id for File nodes in the Graph.
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
-pub struct FileId(u32);
-impl densemap::Index for FileId {
-    fn index(&self) -> usize {
-        self.0 as usize
-    }
-}
-impl From<usize> for FileId {
-    fn from(u: usize) -> FileId {
-        FileId(u as u32)
-    }
-}
 
 /// Id for Build nodes in the Graph.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
@@ -53,12 +43,73 @@ impl From<usize> for BuildId {
 /// A single file referenced as part of a build.
 #[derive(Debug)]
 pub struct File {
+    /// Monotonic index number.
+    index: usize,
     /// Canonical path to the file.
-    pub name: Rc<OsStr>,
+    pub name: Box<OsStr>,
     /// The Build that generates this file, if any.
-    pub input: Option<BuildId>,
+    pub input: RefCell<Option<BuildId>>,
     /// The Builds that depend on this file as an input.
-    pub dependents: Vec<BuildId>,
+    pub dependents: RefCell<Vec<BuildId>>,
+}
+
+impl File {
+    pub fn input(&self) -> Option<BuildId> {
+        *(self.input.borrow_mut())
+    }
+
+    pub fn dependents(&self) -> Vec<BuildId> {
+        (self.dependents.borrow()).clone()
+    }
+}
+
+#[derive(Clone, Debug)]
+/// Id for File nodes in the Graph.
+pub struct FileId(Rc<File>);
+
+impl Index for FileId {
+    fn index(&self) -> usize {
+        self.index
+    }
+}
+
+impl From<File> for FileId {
+    fn from(file: File) -> Self {
+        Self(file.into())
+    }
+}
+
+impl std::ops::Deref for FileId {
+    type Target = File;
+    fn deref(&self) -> &Self::Target {
+        &*self.0
+    }
+}
+
+impl std::borrow::Borrow<OsStr> for FileId {
+    fn borrow(&self) -> &OsStr {
+        &*self.name
+    }
+}
+
+impl Eq for FileId {}
+
+impl PartialEq<FileId> for FileId {
+    fn eq(&self, other: &FileId) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl PartialEq<OsStr> for FileId {
+    fn eq(&self, path: &OsStr) -> bool {
+        &*self.name == path
+    }
+}
+
+impl std::hash::Hash for FileId {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        (&*self.name).hash(state);
+    }
 }
 
 /// A textual location within a build.ninja file, used in error messages.
@@ -68,18 +119,9 @@ pub struct FileLoc<P = FileId> {
     pub line: usize,
 }
 
-impl FileLoc<FileId> {
-    pub fn fill<'a>(&self, graph: &'a Graph) -> FileLoc<&'a OsStr> {
-        FileLoc {
-            path: graph.files.get(self.path).name.as_ref(),
-            line: self.line,
-        }
-    }
-}
-
-impl std::fmt::Display for FileLoc<&OsStr> {
+impl std::fmt::Display for FileLoc<FileId> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
-        write!(f, "{}:{}", self.path.as_str_lossy(), self.line)
+        write!(f, "{}:{}", self.path.name.to_string_lossy(), self.line)
     }
 }
 
@@ -211,78 +253,66 @@ impl Build {
 /// The build graph: owns Files/Builds and maps FileIds/BuildIds to them,
 /// as well as mapping string filenames to the underlying Files.
 pub struct Graph {
-    files: DenseMap<FileId, File>,
     pub builds: DenseMap<BuildId, Build>,
     // Although the `file_to_id`'s keys are filesystem paths, we're using
     // `OsStr` to store then and not `Path`. The reason for this is that `Path`
     // has a very slow `Hash` impl, which normalizes the path every time the
     // hash is computed. It's no more than a slight inconvenience, as `OsStr`
     // implements `AsRef<Path>` and vice versa.
-    file_to_id: HashMap<Rc<OsStr>, FileId>,
+    file_to_id: HashSet<FileId>,
 }
 
 impl Graph {
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         Graph {
-            files: DenseMap::new(),
             builds: DenseMap::new(),
-            file_to_id: HashMap::new(),
+            file_to_id: HashSet::new(),
         }
-    }
-
-    /// Add a new file, generating a new FileId for it.
-    fn add_file(&mut self, name: Rc<OsStr>) -> FileId {
-        self.files.push(File {
-            name,
-            input: None,
-            dependents: Vec::new(),
-        })
-    }
-
-    /// Look up a file by its FileId.
-    pub fn file(&self, id: FileId) -> &File {
-        self.files.get(id)
     }
 
     /// Canonicalize a path and get/generate its FileId.
     pub fn file_id(&mut self, path_buf: impl Into<OsString>) -> FileId {
         let mut path_buf = path_buf.into();
         canon_path_in_place(&mut path_buf);
-        match self.file_to_id.get(&*path_buf) {
-            Some(id) => *id,
+        let path = path_buf.as_os_str();
+        match self.file_to_id.get(path) {
+            Some(id) => id.clone(),
             None => {
-                let path_rc1 = Rc::from(path_buf.as_os_str());
-                let path_rc2 = Rc::clone(&path_rc1);
-                let id = self.add_file(path_rc1);
-                self.file_to_id.insert(path_rc2, id);
+                let id = FileId::from(File {
+                    index: self.file_to_id.len(),
+                    name: Box::from(path),
+                    input: Default::default(),
+                    dependents: Default::default(),
+                });
+                self.file_to_id.insert(id.clone());
                 id
             }
         }
     }
 
+    pub fn file(&self, id: &FileId) -> &FileId {
+        self.file_to_id.get(id).as_ref().unwrap()
+    }
+
     /// Canonicalize a path and look up its FileId.
-    pub fn lookup_file_id(&self, path: impl Into<OsString>) -> Option<FileId> {
-        let canon = canon_path(path);
-        self.file_to_id.get(canon.as_os_str()).copied()
+    pub fn lookup_file_id(&self, path: impl AsRef<OsStr>) -> Option<&FileId> {
+        let canon = canon_path(path.as_ref());
+        self.file_to_id.get(canon.as_os_str())
     }
 
     /// Add a new Build, generating a BuildId for it.
     pub fn add_build(&mut self, build: Build) {
         let id = self.builds.next_id();
-        for &inf in &build.ins.ids {
-            self.files.get_mut(inf).dependents.push(id);
+        for inf in &build.ins.ids {
+            inf.dependents.borrow_mut().push(id);
         }
-        for &out in &build.outs.ids {
-            let f = self.files.get_mut(out);
-            match f.input {
-                Some(b) => {
-                    // TODO this occurs when two builds claim the same output
-                    // file, which is an ordinary user error and which should
-                    // be pretty-printed to the user as such.
-                    panic!("double link {:?}", b);
-                }
-                None => f.input = Some(id),
+        for out in &build.outs.ids {
+            if let Some(b) = &mut out.input.borrow_mut().replace(id).as_mut() {
+                // TODO this occurs when two builds claim the same output
+                // file, which is an ordinary user error and which should
+                // be pretty-printed to the user as such.
+                panic!("double link {:?}", b);
             }
         }
         self.builds.push(build);
@@ -329,10 +359,10 @@ pub struct FileState(DenseMap<FileId, Option<MTime>>);
 
 impl FileState {
     pub fn new(graph: &Graph) -> Self {
-        FileState(DenseMap::new_sized(graph.files.next_id(), None))
+        FileState(DenseMap::new_sized(graph.file_to_id.len(), None))
     }
 
-    pub fn get(&self, id: FileId) -> Option<MTime> {
+    pub fn get(&self, id: &FileId) -> Option<MTime> {
         *self.0.lookup(id).unwrap_or(&None)
     }
 
@@ -348,12 +378,11 @@ const UNIT_SEPARATOR: u8 = 0x1F;
 // Add a list of files to a hasher; used by hash_build.
 fn hash_files(
     hasher: &mut std::collections::hash_map::DefaultHasher,
-    graph: &Graph,
     file_state: &mut FileState,
     ids: &[FileId],
 ) {
-    for &id in ids {
-        let name = &graph.file(id).name;
+    for id in ids {
+        let name = &(id).name;
         let mtime = file_state
             .get(id)
             .unwrap_or_else(|| panic!("no state for {:?}", name));
@@ -371,21 +400,17 @@ fn hash_files(
 // Prerequisite: all referenced files have already been stat()ed and are present.
 // (It doesn't make sense to hash a build with missing files, because it's out
 // of date regardless of the state of the other files.)
-pub fn hash_build(
-    graph: &Graph,
-    file_state: &mut FileState,
-    build: &Build,
-) -> std::io::Result<Hash> {
+pub fn hash_build(file_state: &mut FileState, build: &Build) -> std::io::Result<Hash> {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    hash_files(&mut hasher, graph, file_state, build.dirtying_ins());
+    hash_files(&mut hasher, file_state, build.dirtying_ins());
     hasher.write_u8(UNIT_SEPARATOR);
-    hash_files(&mut hasher, graph, file_state, build.discovered_ins());
+    hash_files(&mut hasher, file_state, build.discovered_ins());
     hasher.write_u8(UNIT_SEPARATOR);
     hash::Hash::hash(&build.cmdline, &mut hasher);
     hasher.write_u8(UNIT_SEPARATOR);
     hash::Hash::hash(&build.rspfile, &mut hasher);
     hasher.write_u8(UNIT_SEPARATOR);
-    hash_files(&mut hasher, graph, file_state, build.outs());
+    hash_files(&mut hasher, file_state, build.outs());
     Ok(Hash(hasher.finish()))
 }
 
